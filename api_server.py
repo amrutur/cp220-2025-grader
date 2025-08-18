@@ -1,5 +1,5 @@
-# api_server.py
-#modified from : https://saptak.in
+#api_server.py
+#modified from : https://saptak.in with lots of help from gemini !
 import os
 import asyncio
 import json
@@ -33,6 +33,94 @@ os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
 # Import your agents
 import agent  # Update with your actual imports
+
+#    This HTML includes JavaScript to handle the form submission.
+
+ask_form = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ask a Question</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f4f4f9; }
+        .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
+        h2 { text-align: center; color: #333; }
+        form { display: flex; flex-direction: column; gap: 1rem; }
+        label { font-weight: 500; color: #555; }
+        input[type="text"] { padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; font-size: 1rem; }
+        input[type="text"]:focus { outline: none; border-color: #007bff; box-shadow: 0 0 0 2px rgba(0,123,255,0.25); }
+        button { padding: 0.75rem; background-color: #007bff; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; transition: background-color 0.2s; }
+        button:hover { background-color: #0056b3; }
+        #response-container { margin-top: 1.5rem; padding: 1rem; background-color: #e9ecef; border-radius: 4px; display: none; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Ask Something</h2>
+        <form id="ask-form">
+            <div>
+                <label for="input1">Query:</label>
+                <input type="text" id="input1" name="input1" placeholder="Enter first value" required>
+            </div>
+            <div>
+                <label for="input2">Questio no:</label>
+                <input type="number" id="input2" name="input2" placeholder="Enter question number" required>
+            </div>
+            <div>
+                <label for="input3">Course number:</label>
+                <input type="text" id="input3" name="input3" placeholder="Enter Course name" required>
+            </div>
+            <button type="submit">Check</button>
+        </form>
+        <div id="response-container">
+            <strong>Response:</strong>
+            <pre id="api-response"></pre>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('ask-form').addEventListener('submit', async function(event) {
+            event.preventDefault(); // Stop the default page reload
+
+            const formData = new FormData(this);
+            const data = {
+                query: formData.get('input1'),
+                qnum: formData.get('input2'),
+                coursenum: formData.get('input3')
+            };
+
+            try {
+                const response = await fetch('/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! Status: ${response.status}`);
+                }
+
+                const result = await response.json();
+
+                // Display the response from the server
+                const responseContainer = document.getElementById('response-container');
+                const apiResponseElement = document.getElementById('api-response');
+                apiResponseElement.textContent = JSON.stringify(result, null, 2);
+                responseContainer.style.display = 'block';
+
+            } catch (error) {
+                console.error('Error:', error);
+                document.getElementById('api-response').textContent = `Error: ${error.message}`;
+                document.getElementById('response-container').style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
+"""
 
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
@@ -78,12 +166,11 @@ SCOPES = [
 
 class QueryRequest(BaseModel):
     query: str
-    user_id: str = "default_user"
-    session_id: str = None
-
+    qnum: int
+    coursenum: str
+ 
 class QueryResponse(BaseModel):
     response: str
-    session_id: str
 
 def set_client_config(project_id, oauth_client_id, oauth_client_secret):
 
@@ -153,7 +240,6 @@ firestore_cred_dict = {
     "universe_domain": "googleapis.com"
 }
 
-print(firestore_cred_dict)
 
 # Initialize Firebase Admin
 cred = credentials.Certificate(firestore_cred_dict)
@@ -168,12 +254,17 @@ try:
 except Exception as e:
     print(f"Error connecting to Firestore: {e}")
     exit(1)
-users_ref = db.collection('users')
-docs = users_ref.stream()
 
-for doc in docs:
-    print(f'{doc.id} => {doc.to_dict()}')
+def get_user_list(db):
+    '''return the list of users in the firestore database'''
+    users_ref = db.collection('users')
+    docs = users_ref.select([]).stream()
+    user_list  = []
 
+    for doc in docs:
+        user_list.append(doc.id)
+
+    return user_list
 
 def get_client_config():
     return client_config
@@ -235,85 +326,106 @@ async def oauth_callback(request: Request,client_config:dict = Depends(get_clien
     userinfo_service = build('oauth2', 'v2', credentials=flow_creds)
     request.session['user'] = userinfo_service.userinfo().get().execute()
 
+
+
     return {"message": f"Hi {request.session['user']['name']} You have successfully logged in. Happy solving!"}
 
-@app.post("/query", response_model=QueryResponse)
-async def process_query(request: QueryRequest):
+
+@app.post("/check", response_model=QueryResponse)
+async def do_check(query_body: QueryRequest, request: Request):
     try:
-        # Get or create session ID
-        #print(f"Received request: {request.query}")
-        session_id = request.session_id or str(uuid.uuid4())
+        if 'user' not in request.session:
+            raise HTTPException(status_code=401, detail="User not authenticated")
 
-        # Check if session exists
-        existing_sessions = await session_service.list_sessions(
-            app_name="CP220_2025_Grader_Agent_API",
-            user_id=request.user_id
-        )
-
-        # Extract existing session IDs
-        if not existing_sessions:
-            existing_session_ids = []
-        else:
-            # Ensure existing_sessions is a list of session objects
-            if not isinstance(existing_sessions, list):
-                existing_sessions = [existing_sessions]
-            # Extract session IDs from the session objects
-            # This assumes each session object has an 'id' attribute
-            # Adjust this line if your session objects have a different structure
-            if hasattr(existing_sessions[0], 'id'):              
-                existing_session_ids = [session.id for session in existing_sessions]
-
-        if not request.session_id or request.session_id not in existing_session_ids:
-            # Create a new session
-            await session_service.create_session(
-                app_name="CP220_2025_Grader_Agent_API",
-                user_id=request.user_id,
-                session_id=session_id
-            )
+        user_id = request.session['user']['id']
+        user_name = request.session['user']['name']
 
         # Create a message from the query
-
         content = types.Content(
             role="user",
-            parts=[types.Part.from_text(text=request.query)]
+            parts=[types.Part.from_text(text=query_body.query)]
         )
 
-        #print(f"Processing query: {request.query} for user: {request.user_id}, session: {session_id}")
+        return QueryResponse(response="Check Ok")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # Run the agent
-        response = runner.run_async(
-            user_id=request.user_id,
-            session_id=session_id,
-            new_message=content
+async def run_agent_and_get_response(current_session_id: str, user_id: str, content: types.Content) -> str:
+    """Helper to run the agent and aggregate the response text from the stream."""
+    response_stream = runner.run_async(
+        user_id=user_id,
+        session_id=current_session_id,
+        new_message=content,
+    )
+    text = ""
+    async for event in response_stream:
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                text += part.text
+        if event.is_final_response():
+            break
+    return text
+
+@app.post("/query", response_model=QueryResponse)
+async def process_query(query_body: QueryRequest, request: Request):
+    if 'user' not in request.session:
+        raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
+
+    try:
+        # Use a consistent session ID for the agent conversation
+        session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
+        request.session['agent_session_id'] = session_id
+
+        user_id = request.session['user']['id']
+        user_name = request.session['user']['name']
+
+        # Create a message from the query
+        content = types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=query_body.query)]
         )
 
-        # Extract the response text
-        response_text:str = ""
-        #for event in response:
-        #    if event.type == "content" and event.content.role == "agent":
-        #        response_text = event.content.parts[0].text
-        #        break
-        async for event in response:
-            #print(f"Event received: {event}")
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    #print(f"Agent Response: {part.text}")
-                    response_text += ";\n" + part.text
-            elif event.is_final_response():
-                print("Agent finished processing.")
-            break # Exit loop after final response
-    
+        print(f"Going to call agent for {user_name}, with answer {content}")        
+
+        try:
+            # Attempt to get the response using the current session ID
+            response_text = await run_agent_and_get_response(session_id,user_id, content)
+        except ValueError as e:
+            # This error indicates the session ID in the cookie is stale or invalid.
+            if "Session not found" in str(e):
+                print(f"Stale session ID '{session_id}' detected. Creating and retrying with a new session.")
+                # Create a new session ID
+                new_session_id = str(uuid.uuid4())
+                # Explicitly create the new session in the database before using it.
+                await session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=user_id,
+                    session_id=new_session_id
+                )
+                request.session['agent_session_id'] = new_session_id
+                response_text = await run_agent_and_get_response(new_session_id, user_id, content)
+            else:
+                # Re-raise any other ValueError that is not a session not found error.
+                raise
+
         if not response_text:
             raise HTTPException(status_code=500, detail="Failed to generate response")
 
-        #print(f"Final response: {response_text}")
-        return QueryResponse(
-            response=response_text,
-            session_id=session_id
-        )
+        print(f"Agent response: {response_text}")
 
+        return QueryResponse(
+            response=response_text
+            )
+
+    except KeyError:
+        raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # By logging the exception with its traceback, you can see the root cause in your server logs.
+        import logging
+        import traceback
+        logging.error("An exception occurred during query processing: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
 @app.get("/", tags=["Authentication"], response_class=HTMLResponse)
 async def root():
@@ -339,13 +451,17 @@ async def root():
 @app.get("/profile")
 async def profile(request: Request):
     # The middleware reads the cookie from the request and loads the session data.
-    print(request.session)
+    #print(request.session)
     user_id = request.session['user']['id']
     user_name = request.session['user']['name']
     if not user_id:
         return {"error": "Not logged in"}
     return {"user_id": user_id, "username": user_name}
     
+@app.get("/ask", response_class=HTMLResponse)
+async def ask(request:Request):
+    ''' serves a simple form for testing access to agent, updation of database etc'''
+    return HTMLResponse(content=ask_form, status_code=200)
 
 
 # Define or import root_agent

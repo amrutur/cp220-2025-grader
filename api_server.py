@@ -375,6 +375,7 @@ async def logout(request: Request):
 import io
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 import json
 
@@ -401,15 +402,23 @@ def get_notebook_content_from_link(creds_dict: dict, file_id: str):
         while not done:
             status, done = downloader.next_chunk()
             # You can add progress reporting here if needed
-            # print(f"Download {int(status.progress() * 100)}%.")
+            print(f"Download {int(status.progress() * 100)}%.")
 
         # The content is in fh; decode it as UTF-8
         notebook_content = fh.getvalue().decode('utf-8')
         return notebook_content
 
+    except HttpError as error:
+        # The HttpError object contains detailed information.
+        print(f"An HTTP error occurred while accessing Google Drive: {error}")
+        # You can inspect the error details for better debugging
+        if error.resp.status == 404:
+            print(f"Error 404: File with ID '{file_id}' not found. Check the file ID and make sure the user has access.")
+        elif error.resp.status == 403:
+            print(f"Error 403: Permission denied for file ID '{file_id}'. The user may not have access, or the app lacks the required 'drive.readonly' scope for this user.")
+        return None
     except Exception as e:
-        # In a production app, you'd want more specific error handling
-        print(f"An error occurred while accessing Google Drive: {e}")
+        print(f"An unexpected error occurred in get_notebook_content_from_link: {e}")
         return None
 
 def get_file_id_from_share_link(share_link: str) -> str or None:
@@ -460,6 +469,64 @@ def load_notebook_from_google_drive(creds_dict: dict, share_link: str):
 
     notebook_content = get_notebook_content_from_link(creds_dict, file_id)
     return notebook_content
+
+def get_notebook_content_from_link_sa(service_account_info: dict, file_id: str):
+    """
+    Downloads content of a google colab notebook from a given file_id using a service account.
+
+    Args:
+        service_account_info: A dictionary of the service account credentials.
+        file_id : file_id of the notebook
+
+    Returns:
+        The content of the notebook as a string, or None if not found.
+    """
+    try:
+        from google.oauth2 import service_account
+
+        scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+        credentials = service_account.Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        drive_service = build('drive', 'v3', credentials=credentials)
+
+        # Download the file content
+        request = drive_service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+
+        # The content is in fh; decode it as UTF-8
+        notebook_content = fh.getvalue().decode('utf-8')
+        return notebook_content
+
+    except HttpError as error:
+        print(f"An HTTP error occurred while accessing Google Drive with Service Account: {error}")
+        if error.resp.status == 404:
+            print(f"Error 404: File with ID '{file_id}' not found. Check the file ID and that it's shared with the service account.")
+        elif error.resp.status == 403:
+            print(f"Error 403: Permission denied for file ID '{file_id}'. Ensure the Drive API is enabled and the service account has permissions.")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred in get_notebook_content_from_link_sa: {e}")
+        return None
+
+def load_notebook_from_google_drive_sa(service_account_info: dict, share_link: str):
+    """
+    Loads a Colab notebook from Google Drive given its share link, using a service account.
+
+    Args:
+        service_account_info: A dictionary containing the service account credentials.
+        share_link: The shareable link to the Colab notebook on Google Drive.
+
+    Returns:
+        The content of the notebook as a string, or None if it cannot be loaded.
+    """
+    file_id = get_file_id_from_share_link(share_link)
+    if not file_id:
+        print("Could not extract file ID from share link.")
+        return None
+    return get_notebook_content_from_link_sa(service_account_info, file_id)
 
 #Example usage:
 # Assuming you have obtained the creds_dict and share_link
@@ -591,9 +658,15 @@ def get_notebook_from_drive(creds_dict: dict, notebook_name: str, folder_path: s
         notebook_content = fh.getvalue().decode('utf-8')
         return notebook_content
 
+    except HttpError as error:
+        print(f"An HTTP error occurred while getting notebook '{notebook_name}': {error}")
+        if error.resp.status == 404:
+            print(f"Error 404: File with ID '{file_id}' not found.")
+        elif error.resp.status == 403:
+            print(f"Error 403: Permission denied for file '{notebook_name}' (ID: {file_id}).")
+        return None
     except Exception as e:
-        # In a production app, you'd want more specific error handling
-        print(f"An error occurred while accessing Google Drive: {e}")
+        print(f"An unexpected error occurred in get_notebook_from_drive: {e}")
         return None
 
 
@@ -689,7 +762,27 @@ async def process_query(query_body: QueryRequest, request: Request):
         )
 
         print(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
-        print(f"rubric link is {query_body.rubric_link}")
+
+        if query_body.rubric_link:
+            # Read rubric notebook using the application's service account, not the logged-in user's credentials.
+            print(f"rubric link is {query_body.rubric_link}")
+            notebook_content = await asyncio.to_thread(
+                load_notebook_from_google_drive_sa, firestore_cred_dict, str(query_body.rubric_link)
+            )
+            if notebook_content is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Rubric notebook '{query_body.rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
+                )
+
+            try:
+                # .ipynb files are JSON, so we can return them as JSON
+                notebook_json = json.loads(notebook_content)
+                print(json.dumps(notebook_json, indent=2))
+                #return JSONResponse(content=notebook_json)
+            except json.JSONDecodeError:
+                # Or return as plain text if it's not valid JSON for some reason
+                return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
+
 
         try:
             # Attempt to get the response using the current session ID

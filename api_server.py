@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse
 import uvicorn
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, AnyUrl
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import RedirectResponse
 
@@ -27,8 +27,9 @@ from firebase_admin import credentials, firestore
 
 
 # Allow insecure transport for local development (OAUTHLIB requirement).
-# This should be commented out or removed for production deployment.
-os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+if (int(os.environ.get('PRODUCTION'))==0):
+    #print("using insecure oauth tranport for development testing")
+    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
 
 # Import your agents
@@ -42,7 +43,7 @@ ask_form = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ask a Question</title>
+    <title>Mimic inputs as if from the notebook cell for checking answer</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f4f4f9; }
         .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
@@ -59,20 +60,30 @@ ask_form = """
 </head>
 <body>
     <div class="container">
-        <h2>Ask Something</h2>
+        <h2>Mimic inputs from notebook asnwer cell's check answer button</h2>
         <form id="ask-form">
             <div>
-                <label for="input1">Query:</label>
-                <input type="text" id="input1" name="input1" placeholder="Enter first value" required>
+                <label for="input1">Question and  Answer:</label>
+                <input type="text" id="input1" name="input1" placeholder="Question: question asked in the cell. Answer: answer provided by stdt" required>
             </div>
             <div>
-                <label for="input2">Questio no:</label>
-                <input type="number" id="input2" name="input2" placeholder="Enter question number" required>
+                <label for="input2">Course No:</label>
+                <input type="text" id="input2" name="input2" placeholder="Enter Course No" required>
             </div>
             <div>
-                <label for="input3">Course number:</label>
-                <input type="text" id="input3" name="input3" placeholder="Enter Course name" required>
+                <label for="input3">Notebook name:</label>
+                <input type="text" id="input3" name="input3" placeholder="Enter notebook name" required>
             </div>
+           <div>
+                <label for="input4">Question Id:</label>
+                <input type="text" id="input4" name="input4" placeholder="Enter Question ID" required>
+            </div>
+
+            <div>
+                <label for="input5">Rubric Link:</label>
+                <input type="text" id="input5" name="input5" placeholder="Enter rubric file link (optional)">
+            </div>
+
             <button type="submit">Check</button>
         </form>
         <div id="response-container">
@@ -88,8 +99,10 @@ ask_form = """
             const formData = new FormData(this);
             const data = {
                 query: formData.get('input1'),
-                qnum: formData.get('input2'),
-                coursenum: formData.get('input3')
+                course_name: formData.get('input2'),
+                notebook_name: formData.get('input3'),
+                q_name: formData.get('input4'),
+                rubric_link: formData.get('input5')
             };
 
             try {
@@ -157,17 +170,23 @@ async def get_client_config():
 
 # --- OAuth2 Configuration ---
 # The redirect URI must match exactly what you have in the Google Cloud Console.
-REDIRECT_URI_INDEX = 2 #change to 1 for production
+if os.environ.get('PRODUCTION')==1 :
+    REDIRECT_URI_INDEX = 1 #production deployment
+else:
+    REDIRECT_URI_INDEX = 2 # testing in local server
 SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
+    "https://www.googleapis.com/auth/drive.readonly",  # Add scope to read Google Drive files
 ]
 
 class QueryRequest(BaseModel):
     query: str
-    qnum: int
-    coursenum: str
+    course_name: str
+    notebook_name: str
+    q_name: str
+    rubric_link: AnyUrl | None = None
  
 class QueryResponse(BaseModel):
     response: str
@@ -210,6 +229,10 @@ def set_client_config(project_id, oauth_client_id, oauth_client_secret):
 load_dotenv()
 
 project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
+
+print(f"project_id is {project_id}")
+
+
 #get secrets from google's secrets manager
 oauth_client_id = "CP220-OAUTH-CLIENT-ID" 
 oauth_client_secret = "CP220-OAUTH-CLIENT-SECRET"
@@ -326,9 +349,289 @@ async def oauth_callback(request: Request,client_config:dict = Depends(get_clien
     userinfo_service = build('oauth2', 'v2', credentials=flow_creds)
     request.session['user'] = userinfo_service.userinfo().get().execute()
 
+    user_id = request.session['user']['id']
+    user_name = request.session['user']['name']
+    user_list = get_user_list(db)
 
+    if user_id not in user_list:
+        print(f"User '{user_name}' ({user_id}) not in database. Adding now.")
+        user_ref = db.collection(u'users').document(user_id)
+        user_ref.set({
+            u'name': user_name,
+            u'email': request.session['user'].get('email')
+        })
 
     return {"message": f"Hi {request.session['user']['name']} You have successfully logged in. Happy solving!"}
+
+@app.get("/logout", tags=["Authentication"])
+async def logout(request: Request):
+    """
+    Logs the user out by clearing their session.
+    """
+    request.session.clear()
+    html_content = "You have been logged out. <a href='/'>Login again</a>"
+    return HTMLResponse(content=html_content)
+
+import io
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import json
+
+def get_notebook_content_from_link(creds_dict: dict, file_id: str):
+    """
+    Downloads content of a google colab notebook from a given file_id.
+
+    Args:
+        creds_dict: A dictionary of the user's OAuth credentials.
+        file_id : file_id of the notebook
+
+    Returns:
+        The content of the notebook as a string, or None if not found.
+    """
+    try:
+        credentials = Credentials(**creds_dict)
+        drive_service = build('drive', 'v3', credentials=credentials)
+
+        # Download the file content
+        request = drive_service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            # You can add progress reporting here if needed
+            # print(f"Download {int(status.progress() * 100)}%.")
+
+        # The content is in fh; decode it as UTF-8
+        notebook_content = fh.getvalue().decode('utf-8')
+        return notebook_content
+
+    except Exception as e:
+        # In a production app, you'd want more specific error handling
+        print(f"An error occurred while accessing Google Drive: {e}")
+        return None
+
+def get_file_id_from_share_link(share_link: str) -> str or None:
+    """
+    Extracts the file ID from a Google Drive share link.
+
+    Args:
+        share_link: The Google Drive share link.
+
+    Returns:
+        The file ID as a string, or None if the link is invalid.
+    """
+    try:
+        # Split the link by '/'
+        parts = share_link.split('/')
+
+        # Find the index of 'd' which usually precedes the file ID
+        d_index = parts.index('d')
+        
+        # The file ID is usually the next part after 'd'
+        file_id = parts[d_index + 1]
+
+        return file_id
+    except ValueError:
+        print("Invalid share link format.")
+        return None
+    except IndexError:
+        print("Could not extract file ID from the share link.")
+        return None
+
+def load_notebook_from_google_drive(creds_dict: dict, share_link: str):
+    """
+    Loads a Colab notebook from Google Drive given its share link.
+
+    Args:
+        creds_dict: A dictionary containing the user's Google API credentials.
+        share_link: The shareable link to the Colab notebook on Google Drive.
+
+    Returns:
+        The content of the notebook as a string, or None if the notebook
+        cannot be loaded.
+    """
+    file_id = get_file_id_from_share_link(share_link)
+
+    if not file_id:
+        print("Could not extract file ID from share link.")
+        return None
+
+    notebook_content = get_notebook_content_from_link(creds_dict, file_id)
+    return notebook_content
+
+#Example usage:
+# Assuming you have obtained the creds_dict and share_link
+# notebook_content = load_notebook_from_google_drive(creds_dict, share_link)
+
+# if notebook_content:
+#   print("Notebook content loaded successfully.")
+#   # Process the notebook content as needed
+# else:
+#   print("Failed to load notebook content.")
+
+
+
+from google.oauth2.credentials import Credentials
+import io
+from googleapiclient.http import MediaIoBaseDownload
+
+def get_folder_id_by_path(drive_service, path: str) -> str | None:
+    """
+    Finds the ID of a folder given its full path from 'My Drive'.
+
+    Args:
+        drive_service: The authenticated Google Drive service client.
+        path: The folder path, e.g., "Colab Notebooks/CP220-2025/Answers".
+
+    Returns:
+        The folder ID as a string, or None if the path is not found.
+    """
+    parent_id = 'root'  # Start from the root of "My Drive"
+    found_path_parts = []
+    # Sanitize path by removing leading/trailing slashes and splitting
+    folders = [folder for folder in path.strip('/').split('/') if folder]
+
+    for folder_name in folders:
+        current_search_path = "My Drive/" + "/".join(found_path_parts)
+        # Note: A more robust implementation might escape special characters in folder_name.
+        query = (
+            f"name = '{folder_name}' and "
+            f"mimeType = 'application/vnd.google-apps.folder' and "
+            f"'{parent_id}' in parents and "
+            f"trashed = false"
+        )
+
+        try:
+            results = drive_service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name)',
+                pageSize=1
+            ).execute()
+        except Exception as e:
+            print(f"Error querying for folder '{folder_name}': {e}")
+            return None
+
+        items = results.get('files', [])
+        if not items:
+            print(f"Folder '{folder_name}' not found in the path: '{current_search_path}'")
+            return None
+
+        parent_id = items[0]['id']  # This becomes the parent for the next iteration
+        found_path_parts.append(folder_name)
+
+    return parent_id
+
+def get_notebook_from_drive(creds_dict: dict, notebook_name: str, folder_path: str | None = None):
+    """
+    Accesses Google Drive to find and download a .ipynb notebook.
+
+    Args:
+        creds_dict: A dictionary of the user's OAuth credentials.
+        notebook_name: The name of the notebook to find (e.g., "MyNotebook.ipynb").
+        folder_path: Optional. The path to the folder containing the notebook, e.g., "Colab Notebooks/CP220-2025".
+
+    Returns:
+        The content of the notebook as a string, or None if not found.
+    """
+    try:
+        credentials = Credentials(**creds_dict)
+        drive_service = build('drive', 'v3', credentials=credentials)
+
+        parent_folder_id = None
+        if folder_path:
+            parent_folder_id = get_folder_id_by_path(drive_service, folder_path)
+            if not parent_folder_id:
+                print(f"The specified folder path was not found: {folder_path}")
+                return None
+
+        # Build the search query
+        query_parts = [
+            f"name = '{notebook_name}'",
+            "trashed = false"
+            # You could also add: "and mimeType = 'application/vnd.google.colaboratory'"
+        ]
+        if parent_folder_id:
+            query_parts.append(f"'{parent_folder_id}' in parents")
+
+        query = " and ".join(query_parts)
+
+        print(f"query={query}, parent_folder_id={parent_folder_id}")
+        results = drive_service.files().list(
+            q=query,
+            spaces='drive',
+            fields='files(id, name)',
+            pageSize=1  # We only need the first match
+        ).execute()
+        items = results.get('files', [])
+
+                
+
+        if not items:
+            location = f"in folder '{folder_path}'" if folder_path else "in your Google Drive"
+            print(f"No notebook named '{notebook_name}' found {location}.")
+            return None
+
+        file_id = items[0]['id']
+        print(f"Found notebook '{items[0]['name']}' with ID: {file_id}")
+
+        # Download the file content
+        request = drive_service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            # You can add progress reporting here if needed
+            # print(f"Download {int(status.progress() * 100)}%.")
+
+        # The content is in fh; decode it as UTF-8
+        notebook_content = fh.getvalue().decode('utf-8')
+        return notebook_content
+
+    except Exception as e:
+        # In a production app, you'd want more specific error handling
+        print(f"An error occurred while accessing Google Drive: {e}")
+        return None
+
+
+@app.get("/notebook/{notebook_name}", tags=["Google Drive"])
+async def read_notebook(notebook_name: str, request: Request, path: str | None = None):
+    """
+    An endpoint to retrieve a notebook from the logged-in user's Google Drive.
+    Optionally, specify the folder path as a query parameter.
+    e.g., /notebook/MyNotebook.ipynb?path=Colab+Notebooks/CP220-2025
+    """
+    if 'credentials' not in request.session:
+        raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
+
+    creds_dict = request.session['credentials']
+
+    # Basic security checks
+    if "/" in notebook_name or ".." in notebook_name:
+        raise HTTPException(status_code=400, detail="Invalid notebook name.")
+    if path and (".." in path):
+        raise HTTPException(status_code=400, detail="Invalid folder path.")
+
+    # Run the blocking Google Drive API call in a separate thread
+    notebook_content = await asyncio.to_thread(get_notebook_from_drive, creds_dict, notebook_name, path)
+
+    if notebook_content is None:
+        location_detail = f"in folder '{path}'" if path else "anywhere"
+        raise HTTPException(
+            status_code=404, detail=f"Notebook '{notebook_name}' not found {location_detail} in your Google Drive."
+        )
+
+    try:
+        # .ipynb files are JSON, so we can return them as JSON
+        notebook_json = json.loads(notebook_content)
+        return JSONResponse(content=notebook_json)
+    except json.JSONDecodeError:
+        # Or return as plain text if it's not valid JSON for some reason
+        return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
+
 
 
 @app.post("/check", response_model=QueryResponse)
@@ -385,7 +688,8 @@ async def process_query(query_body: QueryRequest, request: Request):
             parts=[types.Part.from_text(text=query_body.query)]
         )
 
-        print(f"Going to call agent for {user_name}, with answer {content}")        
+        print(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
+        print(f"rubric link is {query_body.rubric_link}")
 
         try:
             # Attempt to get the response using the current session ID
@@ -411,7 +715,7 @@ async def process_query(query_body: QueryRequest, request: Request):
         if not response_text:
             raise HTTPException(status_code=500, detail="Failed to generate response")
 
-        print(f"Agent response: {response_text}")
+        #print(f"Agent response: {response_text}")
 
         return QueryResponse(
             response=response_text

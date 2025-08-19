@@ -14,6 +14,7 @@ COPY . .
 # Set environment variables
 ENV PORT=8080
 ENV GOOGLE_CLOUD_PROJECT=cp220-grading-assistant
+ENV PRODUCTION=1
 
 # Run the application
 CMD ["python", "api_server.py"]

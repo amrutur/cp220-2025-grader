@@ -1,7 +1,35 @@
 #api_server.py
-#modified from : https://saptak.in with lots of help from gemini !
+''' 
+An api server to access the AI agent for grading answers submitted via
+Google Colab Notebook cell.
+
+The Colab users need to be authenticated via Google's Oauth2 service
+
+The instructure can optionally provide a rubric file to help assist
+the AI agent in grading and providing hints for answers, as well as provide
+marks. The rubric file has to be shared with a service account
+
+It logs the interactions in a Firsestore NoSQl database
+
+Two environment parameters are requred:
+GOOGLE_CLOUD_PROECT (should be set to be the project id for the application google cloud)
+PRODUCTION (should be set to 0 for local testing and 1 for production)
+
+In addition a google service account is needed to access the firestore database as
+well as the rubric (the rubric file has to be shared with the service account)
+
+All the secrets are accessed from the api_server's owner's secret manager on google.
+
+Written with lots of help from google's gemini !
+
+'''
+
 import os
+import sys
 import asyncio
+from google.cloud import secretmanager
+import logging
+import traceback
 import json
 import uuid
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -14,29 +42,151 @@ from starlette.responses import RedirectResponse
 
 from google.adk import Runner
 from google.adk.sessions import DatabaseSessionService, Session
+
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
+
+#import google.generativeai as genai
 from google.genai import types
-from google.cloud import secretmanager
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+import io
 
 
-# Allow insecure transport for local development (OAUTHLIB requirement).
-if (int(os.environ.get('PRODUCTION'))==0):
-    #print("using insecure oauth tranport for development testing")
-    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
+    """
+    Access the payload for the given secret version from google secret manager 
+    and return it.
+    """
+    try:
+        # Create the Secret Manager client.
+        client = secretmanager.SecretManagerServiceClient()
+
+        # Build the resource name of the secret version.
+        name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
+
+        # Access the secret version.
+        response = client.access_secret_version(request={"name": name})
+
+        payload = response.payload.data.decode("UTF-8")
+        return payload
+    except Exception as e:
+        print(f"Error accessing secret: {e}", file=sys.stderr)
+        return None
+
+
+def load_app_config():
+    """Loads all configuration from environment variables and Secret Manager, then initializes services."""
+    load_dotenv()
+
+    # --- Helper functions for loading ---
+    def get_required_env(var_name):
+        value = os.environ.get(var_name)
+        if not value:
+            print(f"Error: Required environment variable '{var_name}' is not set.", file=sys.stderr)
+            sys.exit(1)
+        return value
+
+    project_id = get_required_env("GOOGLE_CLOUD_PROJECT")
+
+    def get_required_secret(key_name_env_var):
+        secret_name = get_required_env(key_name_env_var)
+        payload = access_secret_payload(project_id, secret_name)
+        if not payload:
+            print(f"Error: Could not retrieve secret '{secret_name}' from Secret Manager for project '{project_id}'.", file=sys.stderr)
+            sys.exit(1)
+        return payload
+
+    # --- Load all required values ---
+    is_production = os.environ.get('PRODUCTION', '0') == '1'
+    database_id = get_required_env('FIRESTORE_DATABASE_ID')
+    oauth_client_id = get_required_secret('OAUTH_CLIENT_ID_KEY_NAME')
+    oauth_client_secret = get_required_secret('OAUTH_CLIENT_SECRET_KEY_NAME')
+    signing_secret_key = get_required_secret('SIGNING_SECRET_KEY_NAME')
+    firestore_key_id = get_required_secret('FIRESTORE_PRIVATE_KEY_ID_KEY_NAME')
+    firestore_key_raw = get_required_secret('FIRESTORE_PRIVATE_KEY_KEY_NAME')
+
+    # --- Configure services ---
+    if not is_production:
+        os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+        print("Running in development mode. Insecure OAUTH callback enabled.")
+
+    # --- Construct configuration dictionaries ---
+    firestore_key = firestore_key_raw.replace('\\n', '\n')
+    firestore_cred_dict = {
+        "type": "service_account",
+        "project_id": project_id,
+        "private_key_id": firestore_key_id,
+        "private_key": firestore_key,
+        "client_email": "cp220-firestore@cp220-grading-assistant.iam.gserviceaccount.com",
+        "client_id": "101156988112383641306",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/cp220-firestore%40cp220-grading-assistant.iam.gserviceaccount.com",
+        "universe_domain": "googleapis.com"
+    }
+
+    client_config = {
+        "web": {
+            "client_id": oauth_client_id,
+            "project_id": project_id,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_secret": oauth_client_secret,
+            "redirect_uris": [
+                "http://localhost:8080/callback",
+                "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
+                "https://8080-cs-b88a9ebf-4d62-464d-a6bf-38908d2cb297.cs-asia-southeast1-yelo.cloudshell.dev/callback"
+            ],
+        }
+    }
+
+    # Determine the correct redirect URI based on production status
+    redirect_uri_index = 1 if is_production else 2
+
+    return {
+        "project_id": project_id,
+        "database_id": database_id,
+        "signing_secret_key": signing_secret_key,
+        "firestore_cred_dict": firestore_cred_dict,
+        "client_config": client_config,
+        "redirect_uri_index": redirect_uri_index
+    }
+
+# --- Application Startup ---
+config = load_app_config()
+
+# Initialize Firebase Admin with loaded credentials
+try:
+    cred = credentials.Certificate(config["firestore_cred_dict"])
+    firebase_admin.initialize_app(cred)
+    db = firestore.client(database_id=config["database_id"])
+except Exception as e:
+    print(f"Fatal Error: Could not initialize Firebase/Firestore. {e}", file=sys.stderr)
+    traceback.print_exc()
+    sys.exit(1)
+
+client_config = config["client_config"]
+signing_secret_key = config["signing_secret_key"]
+REDIRECT_URI_INDEX = config["redirect_uri_index"]
+firestore_cred_dict = config["firestore_cred_dict"]
 
 
 # Import your agents
 import agent  # Update with your actual imports
 
-#    This HTML includes JavaScript to handle the form submission.
-
+#  This HTML includes JavaScript to handle the form submission.
+#  This is being used  by the /ask endpoint to help test /query endpoint
+#  by mimicing what would be sent from the google colab notebook
 ask_form = """
 <!DOCTYPE html>
 <html lang="en">
@@ -136,25 +286,6 @@ ask_form = """
 """
 
 
-def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
-    """
-    Access the payload for the given secret version and return it.
-    """
-    try:
-        # Create the Secret Manager client.
-        client = secretmanager.SecretManagerServiceClient()
-
-        # Build the resource name of the secret version.
-        name = f"projects/{project_id}/secrets/{secret_id}/versions/{version_id}"
-
-        # Access the secret version.
-        response = client.access_secret_version(request={"name": name})
-
-        payload = response.payload.data.decode("UTF-8")
-        return payload
-    except Exception as e:
-        print(f"Error accessing secret: {e}")
-        return None
 
 def credentials_to_dict(credentials):
     """Helper function to convert Google credentials to a dictionary."""
@@ -170,10 +301,6 @@ async def get_client_config():
 
 # --- OAuth2 Configuration ---
 # The redirect URI must match exactly what you have in the Google Cloud Console.
-if os.environ.get('PRODUCTION')==1 :
-    REDIRECT_URI_INDEX = 1 #production deployment
-else:
-    REDIRECT_URI_INDEX = 2 # testing in local server
 SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -225,58 +352,10 @@ def set_client_config(project_id, oauth_client_id, oauth_client_secret):
         return client_config
 
 
-# Load environment variables at the top
-load_dotenv()
-
-project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-
-print(f"project_id is {project_id}")
 
 
-#get secrets from google's secrets manager
-oauth_client_id = "CP220-OAUTH-CLIENT-ID" 
-oauth_client_secret = "CP220-OAUTH-CLIENT-SECRET"
-signing_secret_key = access_secret_payload(project_id, "CP220-SIGNING-SECRET-KEY")
-if not signing_secret_key:
-    raise HTTPException(status_code=400, detail="Cant access CP220-SIGNING-SECRET-KEY")
-
-#access the keys related to firestore database
-firestore_key_id = access_secret_payload(project_id,"CP220-FIRESTORE-PRIVATE-KEY-ID")
-
-#secrets manager stores private key with '\n' escaped as '\\n'. we need to undo this.
-firestore_key = access_secret_payload(project_id,"CP220-FIRESTORE-PRIVATE-KEY").replace('\\n', '\n')
-if not firestore_key_id or not firestore_key:
-    raise HTTPException(status_code=400, detail="Cant access CP220-FIRESTORE KEYS")
-
-#construct the credentials to access the database
-firestore_cred_dict = {
-    "type": "service_account",
-    "project_id": project_id,
-    "private_key_id": firestore_key_id,
-    "private_key": firestore_key,
-    "client_email": "cp220-firestore@cp220-grading-assistant.iam.gserviceaccount.com",
-    "client_id": "101156988112383641306",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/cp220-firestore%40cp220-grading-assistant.iam.gserviceaccount.com",
-    "universe_domain": "googleapis.com"
-}
 
 
-# Initialize Firebase Admin
-cred = credentials.Certificate(firestore_cred_dict)
-firebase_admin.initialize_app(cred)
-
-client_config = set_client_config(project_id, oauth_client_id, oauth_client_secret)
-
-
-database_id = "cp220-2025"
-try:
-    db = firestore.client(database_id=database_id)
-except Exception as e:
-    print(f"Error connecting to Firestore: {e}")
-    exit(1)
 
 def get_user_list(db):
     '''return the list of users in the firestore database'''
@@ -288,9 +367,6 @@ def get_user_list(db):
         user_list.append(doc.id)
 
     return user_list
-
-def get_client_config():
-    return client_config
 
 
 app = FastAPI(title="CP220-2025 Agent API")
@@ -304,7 +380,8 @@ app.add_middleware(
 
 
 @app.get("/login", tags=["Authentication"])
-async def login(request: Request, client_config:dict = Depends(get_client_config)):
+#async def login(request: Request, client_config:dict = Depends(get_client_config)):
+async def login(request: Request):
     """
     Redirects the user to the Google OAuth consent screen to initiate login.
     """
@@ -325,7 +402,8 @@ async def login(request: Request, client_config:dict = Depends(get_client_config
     return RedirectResponse(authorization_url)
 
 @app.get("/callback", tags=["Authentication"])
-async def oauth_callback(request: Request,client_config:dict = Depends(get_client_config)):
+#async def oauth_callback(request: Request,client_config:dict = Depends(get_client_config)):
+async def oauth_callback(request: Request):
     """
     Handles the callback from Google after user consent.
     Exchanges the authorization code for credentials and creates a user session.
@@ -372,54 +450,6 @@ async def logout(request: Request):
     html_content = "You have been logged out. <a href='/'>Login again</a>"
     return HTMLResponse(content=html_content)
 
-import io
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload
-import json
-
-def get_notebook_content_from_link(creds_dict: dict, file_id: str):
-    """
-    Downloads content of a google colab notebook from a given file_id.
-
-    Args:
-        creds_dict: A dictionary of the user's OAuth credentials.
-        file_id : file_id of the notebook
-
-    Returns:
-        The content of the notebook as a string, or None if not found.
-    """
-    try:
-        credentials = Credentials(**creds_dict)
-        drive_service = build('drive', 'v3', credentials=credentials)
-
-        # Download the file content
-        request = drive_service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            # You can add progress reporting here if needed
-            print(f"Download {int(status.progress() * 100)}%.")
-
-        # The content is in fh; decode it as UTF-8
-        notebook_content = fh.getvalue().decode('utf-8')
-        return notebook_content
-
-    except HttpError as error:
-        # The HttpError object contains detailed information.
-        print(f"An HTTP error occurred while accessing Google Drive: {error}")
-        # You can inspect the error details for better debugging
-        if error.resp.status == 404:
-            print(f"Error 404: File with ID '{file_id}' not found. Check the file ID and make sure the user has access.")
-        elif error.resp.status == 403:
-            print(f"Error 403: Permission denied for file ID '{file_id}'. The user may not have access, or the app lacks the required 'drive.readonly' scope for this user.")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred in get_notebook_content_from_link: {e}")
-        return None
 
 def get_file_id_from_share_link(share_link: str) -> str or None:
     """
@@ -448,27 +478,6 @@ def get_file_id_from_share_link(share_link: str) -> str or None:
     except IndexError:
         print("Could not extract file ID from the share link.")
         return None
-
-def load_notebook_from_google_drive(creds_dict: dict, share_link: str):
-    """
-    Loads a Colab notebook from Google Drive given its share link.
-
-    Args:
-        creds_dict: A dictionary containing the user's Google API credentials.
-        share_link: The shareable link to the Colab notebook on Google Drive.
-
-    Returns:
-        The content of the notebook as a string, or None if the notebook
-        cannot be loaded.
-    """
-    file_id = get_file_id_from_share_link(share_link)
-
-    if not file_id:
-        print("Could not extract file ID from share link.")
-        return None
-
-    notebook_content = get_notebook_content_from_link(creds_dict, file_id)
-    return notebook_content
 
 def get_notebook_content_from_link_sa(service_account_info: dict, file_id: str):
     """
@@ -528,203 +537,7 @@ def load_notebook_from_google_drive_sa(service_account_info: dict, share_link: s
         return None
     return get_notebook_content_from_link_sa(service_account_info, file_id)
 
-#Example usage:
-# Assuming you have obtained the creds_dict and share_link
-# notebook_content = load_notebook_from_google_drive(creds_dict, share_link)
 
-# if notebook_content:
-#   print("Notebook content loaded successfully.")
-#   # Process the notebook content as needed
-# else:
-#   print("Failed to load notebook content.")
-
-
-
-from google.oauth2.credentials import Credentials
-import io
-from googleapiclient.http import MediaIoBaseDownload
-
-def get_folder_id_by_path(drive_service, path: str) -> str | None:
-    """
-    Finds the ID of a folder given its full path from 'My Drive'.
-
-    Args:
-        drive_service: The authenticated Google Drive service client.
-        path: The folder path, e.g., "Colab Notebooks/CP220-2025/Answers".
-
-    Returns:
-        The folder ID as a string, or None if the path is not found.
-    """
-    parent_id = 'root'  # Start from the root of "My Drive"
-    found_path_parts = []
-    # Sanitize path by removing leading/trailing slashes and splitting
-    folders = [folder for folder in path.strip('/').split('/') if folder]
-
-    for folder_name in folders:
-        current_search_path = "My Drive/" + "/".join(found_path_parts)
-        # Note: A more robust implementation might escape special characters in folder_name.
-        query = (
-            f"name = '{folder_name}' and "
-            f"mimeType = 'application/vnd.google-apps.folder' and "
-            f"'{parent_id}' in parents and "
-            f"trashed = false"
-        )
-
-        try:
-            results = drive_service.files().list(
-                q=query,
-                spaces='drive',
-                fields='files(id, name)',
-                pageSize=1
-            ).execute()
-        except Exception as e:
-            print(f"Error querying for folder '{folder_name}': {e}")
-            return None
-
-        items = results.get('files', [])
-        if not items:
-            print(f"Folder '{folder_name}' not found in the path: '{current_search_path}'")
-            return None
-
-        parent_id = items[0]['id']  # This becomes the parent for the next iteration
-        found_path_parts.append(folder_name)
-
-    return parent_id
-
-def get_notebook_from_drive(creds_dict: dict, notebook_name: str, folder_path: str | None = None):
-    """
-    Accesses Google Drive to find and download a .ipynb notebook.
-
-    Args:
-        creds_dict: A dictionary of the user's OAuth credentials.
-        notebook_name: The name of the notebook to find (e.g., "MyNotebook.ipynb").
-        folder_path: Optional. The path to the folder containing the notebook, e.g., "Colab Notebooks/CP220-2025".
-
-    Returns:
-        The content of the notebook as a string, or None if not found.
-    """
-    try:
-        credentials = Credentials(**creds_dict)
-        drive_service = build('drive', 'v3', credentials=credentials)
-
-        parent_folder_id = None
-        if folder_path:
-            parent_folder_id = get_folder_id_by_path(drive_service, folder_path)
-            if not parent_folder_id:
-                print(f"The specified folder path was not found: {folder_path}")
-                return None
-
-        # Build the search query
-        query_parts = [
-            f"name = '{notebook_name}'",
-            "trashed = false"
-            # You could also add: "and mimeType = 'application/vnd.google.colaboratory'"
-        ]
-        if parent_folder_id:
-            query_parts.append(f"'{parent_folder_id}' in parents")
-
-        query = " and ".join(query_parts)
-
-        print(f"query={query}, parent_folder_id={parent_folder_id}")
-        results = drive_service.files().list(
-            q=query,
-            spaces='drive',
-            fields='files(id, name)',
-            pageSize=1  # We only need the first match
-        ).execute()
-        items = results.get('files', [])
-
-                
-
-        if not items:
-            location = f"in folder '{folder_path}'" if folder_path else "in your Google Drive"
-            print(f"No notebook named '{notebook_name}' found {location}.")
-            return None
-
-        file_id = items[0]['id']
-        print(f"Found notebook '{items[0]['name']}' with ID: {file_id}")
-
-        # Download the file content
-        request = drive_service.files().get_media(fileId=file_id)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            # You can add progress reporting here if needed
-            # print(f"Download {int(status.progress() * 100)}%.")
-
-        # The content is in fh; decode it as UTF-8
-        notebook_content = fh.getvalue().decode('utf-8')
-        return notebook_content
-
-    except HttpError as error:
-        print(f"An HTTP error occurred while getting notebook '{notebook_name}': {error}")
-        if error.resp.status == 404:
-            print(f"Error 404: File with ID '{file_id}' not found.")
-        elif error.resp.status == 403:
-            print(f"Error 403: Permission denied for file '{notebook_name}' (ID: {file_id}).")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred in get_notebook_from_drive: {e}")
-        return None
-
-
-@app.get("/notebook/{notebook_name}", tags=["Google Drive"])
-async def read_notebook(notebook_name: str, request: Request, path: str | None = None):
-    """
-    An endpoint to retrieve a notebook from the logged-in user's Google Drive.
-    Optionally, specify the folder path as a query parameter.
-    e.g., /notebook/MyNotebook.ipynb?path=Colab+Notebooks/CP220-2025
-    """
-    if 'credentials' not in request.session:
-        raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
-
-    creds_dict = request.session['credentials']
-
-    # Basic security checks
-    if "/" in notebook_name or ".." in notebook_name:
-        raise HTTPException(status_code=400, detail="Invalid notebook name.")
-    if path and (".." in path):
-        raise HTTPException(status_code=400, detail="Invalid folder path.")
-
-    # Run the blocking Google Drive API call in a separate thread
-    notebook_content = await asyncio.to_thread(get_notebook_from_drive, creds_dict, notebook_name, path)
-
-    if notebook_content is None:
-        location_detail = f"in folder '{path}'" if path else "anywhere"
-        raise HTTPException(
-            status_code=404, detail=f"Notebook '{notebook_name}' not found {location_detail} in your Google Drive."
-        )
-
-    try:
-        # .ipynb files are JSON, so we can return them as JSON
-        notebook_json = json.loads(notebook_content)
-        return JSONResponse(content=notebook_json)
-    except json.JSONDecodeError:
-        # Or return as plain text if it's not valid JSON for some reason
-        return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
-
-
-
-@app.post("/check", response_model=QueryResponse)
-async def do_check(query_body: QueryRequest, request: Request):
-    try:
-        if 'user' not in request.session:
-            raise HTTPException(status_code=401, detail="User not authenticated")
-
-        user_id = request.session['user']['id']
-        user_name = request.session['user']['name']
-
-        # Create a message from the query
-        content = types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=query_body.query)]
-        )
-
-        return QueryResponse(response="Check Ok")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 async def run_agent_and_get_response(current_session_id: str, user_id: str, content: types.Content) -> str:
     """Helper to run the agent and aggregate the response text from the stream."""
@@ -818,11 +631,10 @@ async def process_query(query_body: QueryRequest, request: Request):
         raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
     except Exception as e:
         # By logging the exception with its traceback, you can see the root cause in your server logs.
-        import logging
-        import traceback
         logging.error("An exception occurred during query processing: %s", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
 
 @app.get("/", tags=["Authentication"], response_class=HTMLResponse)
 async def root():

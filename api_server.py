@@ -5,7 +5,7 @@ Google Colab Notebook cell.
 
 The Colab users need to be authenticated via Google's Oauth2 service
 
-The instructure can optionally provide a rubric file to help assist
+The instructor can optionally provide a rubric file to help assist
 the AI agent in grading and providing hints for answers, as well as provide
 marks. The rubric file has to be shared with a service account
 
@@ -26,8 +26,10 @@ Written with lots of help from google's gemini !
 
 import os
 import sys
-import asyncio
+
 from google.cloud import secretmanager
+import asyncio
+
 import logging
 import traceback
 import json
@@ -42,6 +44,7 @@ from starlette.responses import RedirectResponse
 
 from google.adk import Runner
 from google.adk.sessions import DatabaseSessionService, Session
+from google.adk.agents import Agent
 
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google_auth_oauthlib.flow import Flow
@@ -51,13 +54,14 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-#import google.generativeai as genai
+import google.generativeai as genai
 from google.genai import types
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 
 import io
+
 
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
@@ -112,6 +116,7 @@ def load_app_config():
     signing_secret_key = get_required_secret('SIGNING_SECRET_KEY_NAME')
     firestore_key_id = get_required_secret('FIRESTORE_PRIVATE_KEY_ID_KEY_NAME')
     firestore_key_raw = get_required_secret('FIRESTORE_PRIVATE_KEY_KEY_NAME')
+    gemini_api_key = get_required_secret('GEMINI_API_KEY_NAME')
 
     # --- Configure services ---
     if not is_production:
@@ -145,7 +150,7 @@ def load_app_config():
             "redirect_uris": [
                 "http://localhost:8080/callback",
                 "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
-                "https://8080-cs-b88a9ebf-4d62-464d-a6bf-38908d2cb297.cs-asia-southeast1-yelo.cloudshell.dev/callback"
+                "https://8080-cs-763793587292-default.cs-asia-southeast1-fork.cloudshell.dev/callback"
             ],
         }
     }
@@ -159,8 +164,11 @@ def load_app_config():
         "signing_secret_key": signing_secret_key,
         "firestore_cred_dict": firestore_cred_dict,
         "client_config": client_config,
-        "redirect_uri_index": redirect_uri_index
+        "redirect_uri_index": redirect_uri_index,
+        "gemini_api_key": gemini_api_key
     }
+
+
 
 # --- Application Startup ---
 config = load_app_config()
@@ -180,6 +188,7 @@ signing_secret_key = config["signing_secret_key"]
 REDIRECT_URI_INDEX = config["redirect_uri_index"]
 firestore_cred_dict = config["firestore_cred_dict"]
 
+os.environ['GOOGLE_API_KEY'] = str(config["gemini_api_key"])
 
 # Import your agents
 import agent  # Update with your actual imports
@@ -263,7 +272,7 @@ ask_form = """
                 });
 
                 if (!response.ok) {
-                    throw new Error(`HTTP error! Status: ${response.status}`);
+                    throw new Error(`HTTP Error! query: ${data.query} course_name:${data.course_name} notebook_name: ${data.notebook_name} q_name:${data.q_name} Status: ${response.status}`);
                 }
 
                 const result = await response.json();
@@ -296,9 +305,6 @@ def credentials_to_dict(credentials):
             'client_secret': credentials.client_secret,
             'scopes': credentials.scopes}
 
-async def get_client_config():
-    return client_config
-
 # --- OAuth2 Configuration ---
 # The redirect URI must match exactly what you have in the Google Cloud Console.
 SCOPES = [
@@ -317,43 +323,6 @@ class QueryRequest(BaseModel):
  
 class QueryResponse(BaseModel):
     response: str
-
-def set_client_config(project_id, oauth_client_id, oauth_client_secret):
-
-    secret_status = ""
-    if not project_id:
-        raise HTTPException(status_code=500, detail="GOOGLE_CLOUD_PROJECT environment variable not set.")
-
-    if project_id:
-        oauth_client_id_value = access_secret_payload(project_id, oauth_client_id)
-        oauth_client_secret_value = access_secret_payload(project_id, oauth_client_secret)
- 
-        if not oauth_client_id_value:
-            raise HTTPException(status_code=500, detail="Could not access value of oauth client ID '{oauth_client_id}'. Check permissions and if the secret exists.\n")
-
-        if not oauth_client_secret_value:
-            raise HTTPException(status_code=500, detail="Could not access secret value of  '{oauth_client_secret}'. Check permissions and if the secret exists.")
-
-        client_config = {
-            "web": {
-                "client_id": oauth_client_id_value,
-                "project_id": project_id,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "client_secret": oauth_client_secret_value,
-                "redirect_uris": [
-                    "http://localhost:8080/callback",
-                    "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
-                    "https://8080-cs-b88a9ebf-4d62-464d-a6bf-38908d2cb297.cs-asia-southeast1-yelo.cloudshell.dev/callback"
-                ],
-            }
-        }
-        return client_config
-
-
-
-
 
 
 
@@ -465,11 +434,20 @@ def get_file_id_from_share_link(share_link: str) -> str or None:
         # Split the link by '/'
         parts = share_link.split('/')
 
-        # Find the index of 'd' which usually precedes the file ID
-        d_index = parts.index('d')
+        #print('from get_file_id_from_share_link', parts)
+
+        # Find the index of 'd' or 'drive' which usually precedes the file ID
+        if 'd' in parts:
+            d_index = parts.index('d')
+        elif 'drive' in parts:
+            d_index = parts.index('drive')
+        else:
+            raise IndexError
         
         # The file ID is usually the next part after 'd'
         file_id = parts[d_index + 1]
+        subparts = file_id.split('?')
+        file_id = subparts[0]
 
         return file_id
     except ValueError:
@@ -557,6 +535,9 @@ async def run_agent_and_get_response(current_session_id: str, user_id: str, cont
 
 @app.post("/query", response_model=QueryResponse)
 async def process_query(query_body: QueryRequest, request: Request):
+
+    print("Processing Query")
+
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
 

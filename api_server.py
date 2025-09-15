@@ -192,6 +192,26 @@ os.environ['GOOGLE_API_KEY'] = str(config["gemini_api_key"])
 
 # Import your agents
 import agent  # Update with your actual imports
+# Define or import agents
+root_agent = agent.root_agent  # Update this line if your agent module uses a different name or structure
+scoring_agent=agent.scoring_agent
+
+# Create a database session service
+session_service = DatabaseSessionService(
+    db_url="sqlite:///agent_sessions.db"
+)
+
+# Create a runner with your agents
+runner_assist = Runner(
+    app_name="CP220_2025_Grader_Agent_API",
+    agent=root_agent,  # Add all your agents here
+    session_service=session_service
+)
+runner_score = Runner(
+    app_name="CP220_2025_Scoring_Agent_API",
+    agent=scoring_agent,  # Add all your agents here
+    session_service=session_service
+)
 
 #  This HTML includes JavaScript to handle the form submission.
 #  This is being used  by the /ask endpoint to help test /query endpoint
@@ -517,7 +537,7 @@ def load_notebook_from_google_drive_sa(service_account_info: dict, share_link: s
 
 
 
-async def run_agent_and_get_response(current_session_id: str, user_id: str, content: types.Content) -> str:
+async def run_agent_and_get_response(current_session_id: str, user_id: str, content: types.Content, runner:Runner) -> str:
     """Helper to run the agent and aggregate the response text from the stream."""
     response_stream = runner.run_async(
         user_id=user_id,
@@ -536,7 +556,8 @@ async def run_agent_and_get_response(current_session_id: str, user_id: str, cont
 @app.post("/query", response_model=QueryResponse)
 async def process_query(query_body: QueryRequest, request: Request):
 
-    print("Processing Query")
+   # print("Processing Query")
+    runner = runner_assist
 
     if 'user' not in request.session:
         raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
@@ -580,7 +601,7 @@ async def process_query(query_body: QueryRequest, request: Request):
 
         try:
             # Attempt to get the response using the current session ID
-            response_text = await run_agent_and_get_response(session_id,user_id, content)
+            response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
         except ValueError as e:
             # This error indicates the session ID in the cookie is stale or invalid.
             if "Session not found" in str(e):
@@ -594,7 +615,93 @@ async def process_query(query_body: QueryRequest, request: Request):
                     session_id=new_session_id
                 )
                 request.session['agent_session_id'] = new_session_id
-                response_text = await run_agent_and_get_response(new_session_id, user_id, content)
+                response_text = await run_agent_and_get_response(new_session_id, user_id, content,runner)
+            else:
+                # Re-raise any other ValueError that is not a session not found error.
+                raise
+
+        if not response_text:
+            raise HTTPException(status_code=500, detail="Failed to generate response")
+
+        #print(f"Agent response: {response_text}")
+
+        return QueryResponse(
+            response=response_text
+            )
+
+    except KeyError:
+        raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
+    except Exception as e:
+        # By logging the exception with its traceback, you can see the root cause in your server logs.
+        logging.error("An exception occurred during query processing: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+@app.post("/grade", response_model=QueryResponse)
+async def grade(query_body: QueryRequest, request: Request):
+    '''Grade a single question in the notebook'''
+
+    #print("Grading Question")
+    
+    runner= runner_score
+
+    if 'user' not in request.session:
+        raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
+
+    try:
+        # Use a consistent session ID for the agent conversation
+        session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
+        request.session['agent_session_id'] = session_id
+
+        user_id = request.session['user']['id']
+        user_name = request.session['user']['name']
+
+        # Create a message from the query
+        content = types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=query_body.query)]
+        )
+
+        #print(f"User {user_name}, has asked for grading aquestion {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
+
+        if query_body.rubric_link:
+            # Read rubric notebook using the application's service account, not the logged-in user's credentials.
+            print(f"rubric link is {query_body.rubric_link}")
+            notebook_content = await asyncio.to_thread(
+                load_notebook_from_google_drive_sa, firestore_cred_dict, str(query_body.rubric_link)
+            )
+            if notebook_content is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Rubric notebook '{query_body.rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
+                )
+
+            try:
+                # .ipynb files are JSON, so we can return them as JSON
+                notebook_json = json.loads(notebook_content)
+                print(json.dumps(notebook_json, indent=2))
+                #return JSONResponse(content=notebook_json)
+            except json.JSONDecodeError:
+                # Or return as plain text if it's not valid JSON for some reason
+                return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
+
+
+        try:
+            # Attempt to get the response using the current session ID
+            response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
+        except ValueError as e:
+            # This error indicates the session ID in the cookie is stale or invalid.
+            if "Session not found" in str(e):
+                print(f"Stale session ID '{session_id}' detected. Creating and retrying with a new session.")
+                # Create a new session ID
+                new_session_id = str(uuid.uuid4())
+                # Explicitly create the new session in the database before using it.
+                await session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=user_id,
+                    session_id=new_session_id
+                )
+                request.session['agent_session_id'] = new_session_id
+                response_text = await run_agent_and_get_response(new_session_id, user_id, content,runner)
             else:
                 # Re-raise any other ValueError that is not a session not found error.
                 raise
@@ -654,21 +761,6 @@ async def ask(request:Request):
     return HTMLResponse(content=ask_form, status_code=200)
 
 
-# Define or import root_agent
-root_agent = agent.root_agent  # Update this line if your agent module uses a different name or structure
-
-
-# Create a database session service
-session_service = DatabaseSessionService(
-    db_url="sqlite:///agent_sessions.db"
-)
-
-# Create a runner with your agents
-runner = Runner(
-    app_name="CP220_2025_Grader_Agent_API",
-    agent=root_agent,  # Add all your agents here
-    session_service=session_service
-)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))

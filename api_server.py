@@ -36,6 +36,8 @@ import json
 import uuid
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+
 import uvicorn
 from dotenv import load_dotenv
 from pydantic import BaseModel, AnyUrl
@@ -61,7 +63,28 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 import io
+import re
+from typing import  Dict, Any
+import datetime
+import pytz
 
+# Set the overall logging level to DEBUG
+#logging.basicConfig(level=logging.INFO)
+
+# Set specific loggers for Starlette/ADK to DEBUG if needed
+#logging.getLogger("uvicorn").setLevel(logging.INFO)
+#logging.getLogger("starlette").setLevel(logging.INFO)
+#logging.getLogger("google_adk").setLevel(logging.DEBUG) 
+
+# Note: Using logging.DEBUG will flood your console with internal steps, 
+# which is perfect for debugging agent logic.
+
+
+# Disable the assist API during this time window
+# should be made configurable via environment variables
+# or via firestore database in the future
+ASSIST_API_DISABLE_START = datetime.datetime(2025, 10, 6,12,00,00)
+ASSIST_API_DISABLE_END = datetime.datetime(2025, 10, 6,17,0,00)
 
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
@@ -150,7 +173,7 @@ def load_app_config():
             "redirect_uris": [
                 "http://localhost:8080/callback",
                 "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
-                "https://8080-cs-763793587292-default.cs-asia-southeast1-fork.cloudshell.dev/callback"
+                "https://b5ee73f0d420.ngrok-free.app/callback"
             ],
         }
     }
@@ -336,13 +359,54 @@ SCOPES = [
 
 class QueryRequest(BaseModel):
     query: str
-    course_name: str
-    notebook_name: str
+    course_id: str
+    notebook_id: str
     q_name: str
     rubric_link: AnyUrl | None = None
+    user_name: str | None = None
+    user_email: str | None = None
  
 class QueryResponse(BaseModel):
     response: str
+
+class AssistRequest(BaseModel):
+    query: str
+    q_id: str
+    rubric_link: AnyUrl | None = None
+    user_name: str | None = None
+    user_email: str | None = None
+
+ 
+class AssistResponse(BaseModel):
+    response: str
+
+class GradeRequest(BaseModel):
+    question: str
+    answer: str
+    rubric: str
+    course_id: str | None = None
+    notebook_id: str | None = None
+    q_id: str | None = None
+    user_name: str | None = None
+    user_email: str | None = None
+ 
+class GradeResponse(BaseModel):
+    response: str
+    marks: float
+
+class EvalRequest(BaseModel):
+    course_id: str
+    user_name: str 
+    user_email: str
+    notebook_id: str
+    answer_notebook: str
+    answer_hash: str
+    rubric_link: AnyUrl
+
+
+class EvalResponse(BaseModel):
+    response: str
+    marks: float
 
 
 
@@ -357,8 +421,66 @@ def get_user_list(db):
 
     return user_list
 
+def add_user_if_not_exists(db, google_user_id, user_name, user_email, google_user_name):
+    '''add the user to the firestore database if not already present'''
+    user_list = get_user_list(db)
+
+    if google_user_id not in user_list:
+        print(f"User '{user_name}' ({google_user_id}) not in database. Adding now.")
+        user_ref = db.collection(u'users').document(google_user_id)
+        user_ref.set({
+            u'name': user_name,
+            u'email': user_email,
+            u'google_user_name': google_user_name
+        })
+
+def add_answer_notebook(db, google_user_id, notebook_id, answer_notebook, answer_hash):
+    '''add the answer notebook to the firestore database'''
+    try:
+        answer_ref = db.collection(u'users').document(google_user_id).collection(u'notebooks').document(notebook_id)
+        answer_ref.set({
+            u'answer_notebook': answer_notebook,
+            u'answer_hash': answer_hash,
+            u'submitted_at': firestore.SERVER_TIMESTAMP      
+        })
+    except Exception as e:
+        print(f"Error adding answer notebook to Firestore: {e}", file=sys.stderr)
+        traceback.print_exc()
+
+def update_marks(db, google_user_id, notebook_id, total_marks, max_marks,graded):
+    '''update the marks for the answer notebook of google_user_id in the firestore database'''
+    try:
+        answer_ref = db.collection(u'users').document(google_user_id).collection(u'notebooks').document(notebook_id)
+        answer_ref.set({
+            u'total_marks': total_marks,
+            u'max_marks': max_marks,
+            u'graded_at': firestore.SERVER_TIMESTAMP      
+        },merge=True)
+        # Also update the graded details
+        answer_ref.set({
+            u'graded': graded
+        },merge=True)
+    except Exception as e:
+        print(f"Error updating marks in Firestore: {e}", file=sys.stderr)
+        traceback.print_exc()
 
 app = FastAPI(title="CP220-2025 Agent API")
+
+origins = [
+    "http://localhost",
+    "http://localhost:8080",
+    "*",
+    # You can also use "*" to allow all origins
+]
+
+#app.add_middleware(
+#    CORSMiddleware,
+#    allow_origins=["*"],  # Allows all origins
+#    allow_credentials=True,
+#    allow_methods=["*"],
+#    allow_headers=["*"],
+#)
+
 
 # Add the session middleware
 # The secret_key is used to sign the session cookie for security.
@@ -374,6 +496,9 @@ async def login(request: Request):
     """
     Redirects the user to the Google OAuth consent screen to initiate login.
     """
+    print("Request Headers:", request.headers)
+    print("Client Host:", request.client.host)    
+
     flow = Flow.from_client_config(
         client_config=client_config,
         scopes=SCOPES,
@@ -544,31 +669,162 @@ async def run_agent_and_get_response(current_session_id: str, user_id: str, cont
         session_id=current_session_id,
         new_message=content,
     )
+
+    #print(f"Trace-id={response_stream.trace_id}")
+
+    try:
+        # 1. Convert the memory object to a dictionary (most ADK-style objects support this)
+        memory_contents = dict(runner.memory.items())  # Accessing items() for dict-like behavior
+    
+        # 2. Print using JSON for clean, formatted output
+        print("--- FULL AGENT ARTIFACTS (MEMORY) DUMP ---")
+        print(json.dumps(memory_contents, indent=4))
+        print("------------------------------------------")
+
+    except AttributeError:
+        # Fallback in case the memory object requires a specific getter method (e.g., .to_dict())
+        print("Could not directly convert memory to dict. Check ADK documentation for .to_dict() or equivalent.")
+
+
     text = ""
     async for event in response_stream:
         if event.content and event.content.parts:
             for part in event.content.parts:
                 text += part.text
+                #print(f"Received part: {part.text}")
         if event.is_final_response():
             break
     return text
 
-@app.post("/query", response_model=QueryResponse)
-async def process_query(query_body: QueryRequest, request: Request):
+@app.post("/assist", response_model=AssistResponse)
+async def assist(query_body: AssistRequest, request: Request):
+
+    #check if the this API is disabled currently
+    now_utc = datetime.datetime.now(pytz.utc)
+    now_ist = now_utc.astimezone(pytz.timezone('Asia/Kolkata'))
+    if ASSIST_API_DISABLE_START.date() <= now_ist.date() and \
+        now_ist.date()  <= ASSIST_API_DISABLE_END.date() and \
+        ASSIST_API_DISABLE_START.time() <= now_ist.time() and \
+        now_ist.time()  <= ASSIST_API_DISABLE_END.time():
+        raise HTTPException(status_code=503, detail="The assist API is temporarily disabled during quiz. Please try again later.")
 
    # print("Processing Query")
     runner = runner_assist
 
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
+    #if 'user' not in request.session:
+    #    raise HTTPException(status_code=401, detail="User not authenticated. #Please login first.")
 
     try:
         # Use a consistent session ID for the agent conversation
+        #print(request.session)
         session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
         request.session['agent_session_id'] = session_id
 
-        user_id = request.session['user']['id']
-        user_name = request.session['user']['name']
+        #user_id = request.session['user']['id']
+        #user_name = request.session['user']['name']
+
+        user_id = query_body.user_email if query_body.user_email else "anonymous_user"
+        user_name = query_body.user_name if query_body.user_name else "Anonymous User"
+
+
+        #print(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
+        rubric = ''
+        #print(f"content is {content}")
+        if query_body.rubric_link:
+            # Read rubric notebook using the application's service account, not the logged-in user's credentials.
+            #print(f"rubric link is {query_body.rubric_link}")
+            notebook_content = await asyncio.to_thread(
+                load_notebook_from_google_drive_sa, firestore_cred_dict, str(query_body.rubric_link)
+            )
+            if notebook_content is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Rubric notebook '{query_body.rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
+                )
+
+            try:
+                # .ipynb files are JSON, so we can return them as JSON
+                notebook_json = json.loads(notebook_content)
+                #print(json.dumps(notebook_json, indent=2))
+                #return JSONResponse(content=notebook_json)
+            except json.JSONDecodeError:
+                # Or return as plain text if it's not valid JSON for some reason
+                return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
+            rubric =  "The rubric is: " + ''.join(notebook_json['cells'][q_id+1]['source'])
+        # Create a message from the query
+        content = types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=query_body.query+rubric)]
+        )
+
+        try:
+            # Attempt to get the response using the current session ID
+            response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
+        except ValueError as e:
+            # This error indicates the session ID in the cookie is stale or invalid.
+            if "Session not found" in str(e):
+                print(f"Stale session ID '{session_id}' detected. Creating and retrying with a new session.")
+                # Create a new session ID
+                new_session_id = str(uuid.uuid4())
+                # Explicitly create the new session in the database before using it.
+                await session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=user_id,
+                    session_id=new_session_id
+                )
+                request.session['agent_session_id'] = new_session_id
+                response_text = await run_agent_and_get_response(new_session_id, user_id, content,runner)
+            else:
+                # Re-raise any other ValueError that is not a session not found error.
+                raise
+
+        if not response_text:
+            raise HTTPException(status_code=500, detail="Failed to generate response")
+
+        print(f"Agent response: {response_text}")
+
+        return AssistResponse(
+            response=response_text
+            )
+
+    except KeyError:
+        raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
+    except Exception as e:
+        # By logging the exception with its traceback, you can see the root cause in your server logs.
+        logging.error("An exception occurred during query processing: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
+@app.post("/query", response_model=QueryResponse)
+async def process_query(query_body: QueryRequest, request: Request):
+
+
+    #check if the this API is disabled currently
+    now_utc = datetime.datetime.now(pytz.utc)
+    now_ist = now_utc.astimezone(pytz.timezone('Asia/Kolkata'))
+    if ASSIST_API_DISABLE_START.date() <= now_ist.date() and \
+        now_ist.date()  <= ASSIST_API_DISABLE_END.date() and \
+        ASSIST_API_DISABLE_START.time() <= now_ist.time() and \
+        now_ist.time()  <= ASSIST_API_DISABLE_END.time():
+        raise HTTPException(status_code=503, detail="The assist API is temporarily disabled during quiz. Please try again later.")
+
+   # print("Processing Query")
+    runner = runner_assist
+
+    #if 'user' not in request.session:
+    #    raise HTTPException(status_code=401, detail="User not authenticated. #Please login first.")
+
+    try:
+        # Use a consistent session ID for the agent conversation
+        print(request.session)
+        session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
+        request.session['agent_session_id'] = session_id
+
+        #user_id = request.session['user']['id']
+        #user_name = request.session['user']['name']
+
+        user_id = query_body.user_email if query_body.user_email else "anonymous_user"
+        user_name = query_body.user_name if query_body.user_name else "Anonymous User"
 
         # Create a message from the query
         content = types.Content(
@@ -578,6 +834,7 @@ async def process_query(query_body: QueryRequest, request: Request):
 
         print(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
 
+        #print(f"content is {content}")
         if query_body.rubric_link:
             # Read rubric notebook using the application's service account, not the logged-in user's credentials.
             print(f"rubric link is {query_body.rubric_link}")
@@ -592,7 +849,7 @@ async def process_query(query_body: QueryRequest, request: Request):
             try:
                 # .ipynb files are JSON, so we can return them as JSON
                 notebook_json = json.loads(notebook_content)
-                print(json.dumps(notebook_json, indent=2))
+                #print(json.dumps(notebook_json, indent=2))
                 #return JSONResponse(content=notebook_json)
             except json.JSONDecodeError:
                 # Or return as plain text if it's not valid JSON for some reason
@@ -623,7 +880,7 @@ async def process_query(query_body: QueryRequest, request: Request):
         if not response_text:
             raise HTTPException(status_code=500, detail="Failed to generate response")
 
-        #print(f"Agent response: {response_text}")
+        print(f"Agent response: {response_text}")
 
         return QueryResponse(
             response=response_text
@@ -637,83 +894,261 @@ async def process_query(query_body: QueryRequest, request: Request):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
-@app.post("/grade", response_model=QueryResponse)
-async def grade(query_body: QueryRequest, request: Request):
-    '''Grade a single question in the notebook'''
-
-    #print("Grading Question")
+async def score_question(question:str, answer:str, rubric:str, runner:Runner, request: Request, user_id: str) -> tuple[float,str]:
+    '''
+    Score a single question-answer with the rubric using the scoring agent
     
-    runner= runner_score
+    Inputs:
+    question: The question asked
+    answer: The student's answer
+    rubric: The rubric to be used for grading
+    runner: The runner with the scoring agent
+    request: The FastAPI request object (to access session)
+    user_id: The user ID of the student
 
-    if 'user' not in request.session:
-        raise HTTPException(status_code=401, detail="User not authenticated. Please login first.")
+    Outputs:
+    marks: The marks awarded
+    response_text: The agent's response
+
+    '''
+
 
     try:
+
         # Use a consistent session ID for the agent conversation
         session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
         request.session['agent_session_id'] = session_id
 
-        user_id = request.session['user']['id']
-        user_name = request.session['user']['name']
+        question = "The question asked is: " + question + "."
+        answer = "The student's answer is: " + answer + "."
+        rubric = "The rubric is: " + rubric +"."
 
-        # Create a message from the query
+        # Create the prompt content
         content = types.Content(
             role="user",
-            parts=[types.Part.from_text(text=query_body.query)]
+            parts=[types.Part.from_text(text=question + answer + rubric)]
         )
 
-        #print(f"User {user_name}, has asked for grading aquestion {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
-
-        if query_body.rubric_link:
-            # Read rubric notebook using the application's service account, not the logged-in user's credentials.
-            print(f"rubric link is {query_body.rubric_link}")
-            notebook_content = await asyncio.to_thread(
-                load_notebook_from_google_drive_sa, firestore_cred_dict, str(query_body.rubric_link)
+        # Attempt to get the response using the current session ID
+        response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
+    except ValueError as e:
+        # This error indicates the session ID in the cookie is stale or invalid.
+        if "Session not found" in str(e):
+            print(f"Stale session ID '{session_id}' detected. Creating and retrying with a new session.")
+            # Create a new session ID
+            new_session_id = str(uuid.uuid4())
+            # Explicitly create the new session in the database before using it.
+            await session_service.create_session(
+                app_name=runner.app_name,
+                user_id=user_id,
+                session_id=new_session_id
             )
-            if notebook_content is None:
-                raise HTTPException(
-                    status_code=404, detail=f"Rubric notebook '{query_body.rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
-                )
+            #request.session['agent_session_id'] = new_session_id
+            response_text = await run_agent_and_get_response(new_session_id, user_id, content,runner)
+        else:
+            # Re-raise any other ValueError that is not a session not found error.
+            raise
 
-            try:
-                # .ipynb files are JSON, so we can return them as JSON
-                notebook_json = json.loads(notebook_content)
-                print(json.dumps(notebook_json, indent=2))
-                #return JSONResponse(content=notebook_json)
-            except json.JSONDecodeError:
-                # Or return as plain text if it's not valid JSON for some reason
-                return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
+    if not response_text:
+        raise HTTPException(status_code=500, detail="Agent failed to generate response")
 
+    #extract the marks from the response text
+    marks = 0.0
+    marks_pattern = r"The\s+total\s+marks\s+is\s+(\d+\.?\d*)"
+    marks_match = re.search(marks_pattern, response_text, re.IGNORECASE)
+    if marks_match:
+        marks = float(marks_match.group(1))
+    else:
+        print("Could not extract marks from the agent's response. Defaulting to 0.0")
+
+    return marks, response_text
+
+@app.post("/grade", response_model=GradeResponse)
+async def grade(query_body: GradeRequest, request: Request):
+
+    '''Grade a single question-answer'''
+    runner = runner_score
+
+    #if 'user' not in request.session:
+    #    raise HTTPException(status_code=401, detail="User not authenticated. #Please login first.")
+
+    try:
+        # Use a consistent session ID for the agent conversation
+        #print(request.session)
+        session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
+        request.session['agent_session_id'] = session_id
+
+        #user_id = request.session['user']['id']
+        #user_name = request.session['user']['name']
+
+        user_id = query_body.user_email if query_body.user_email else "Null@Null"
+        user_name = query_body.user_name if query_body.user_name else "Anonymous"
+
+        if not query_body.question:
+            raise HTTPException(status_code=400, detail="Question not provided")
+          
+        question =  query_body.question + "."
+        answer = query_body.answer + "." if query_body.answer else "No answer."
+        rubric =  query_body.rubric if query_body.rubric else "No rubric"
+
+        marks, response_text = await score_question(question, answer, rubric, runner, session_id, user_id)
+
+        return GradeResponse(
+            response=response_text,
+            marks = marks
+        )
+
+    except KeyError:
+        raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
+    except Exception as e:
+        # By logging the exception with its traceback, you can see the root cause in your server logs.
+        logging.error("An exception occurred during query processing: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
+async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, user_id: str)-> tuple[float,float,int,dict]:
+    '''Evaluate the submitted notebook by grading all questions using the scoring agent'''
+    try:
+        acells = answer_json['ipynb']['cells']
+        rcells = rubric_json['cells']
+        total_marks = 0.0
+        max_marks = 0.0
+        num_questions = 0
+
+        qpattern = r"\*\*Q(\d+)\*\*.*\((\d+\.?\d*)"
+
+        #extract the questions from the rubric cells and match with the answer cells
+        i = 0
+        questions = {}
+        rubrics={}
+        graded={} #graders response and marks
+        #print(f"Total cells in rubric notebook: {len(rcells)}")
+        while i < len(rcells) :
+            if rcells[i]['cell_type'] == 'markdown':
+                #check if it is a question cell
+                #print(f"Checking rubric cell {i} for question pattern.{''.join(rcells[i].get('source', []))}")
+                qmatch = re.search(qpattern, ''.join(rcells[i].get('source', [])))
+                if qmatch:
+                    qnum = int(qmatch.group(1))
+                    qmarks = float(qmatch.group(2))
+                    max_marks += qmarks
+                    num_questions += 1
+                    questions[qnum]=''.join(rcells[i].get('source', []))
+                    #print(f"Cell {i} qnum={qnum} with max marks {qmarks}")
+                    i += 1
+                    #next cell should be the rubric cell
+                    if i < len(rcells):
+                        rubrics[qnum]=''.join(rcells[i].get('source', []))
+                    else:
+                        raise Exception(f"Rubric cell missing after question {qnum}")
+                
+            i += 1
+        print(f"Extracted {num_questions} questions from rubric notebook with total marks {max_marks}. Now grading answers.")
+        i=0
+        while i < len(acells):
+            #rint(f"Checking answer cell {i} for question pattern")
+            if acells[i]['cell_type'] == 'markdown':
+                #check if it is a question cell
+                qmatch = re.search(r"\*\*Q(\d+)\*\*", ''.join(acells[i].get('source', [])))
+                if qmatch:
+                    qnum = int(qmatch.group(1))
+                    i+=1
+                    if i < len(acells) and acells[i]['cell_type'] == 'markdown':
+                        answer=''.join(acells[i].get('source', []))
+                    else:
+                        answer="No answer provided."
+                    #print(f"scoring question {qnum} for user {user_id}")
+                    #print(f"Question: {questions[qnum]}")
+                    marks, response_text = await score_question(questions[qnum], answer, rubrics[qnum], runner, request, user_id)
+                    total_marks += marks
+                    graded[qnum] = {'marks': marks, 'response': response_text}
+            i += 1
+        return total_marks, max_marks, num_questions, graded
+
+    except Exception as e:
+        print(f"Error during evaluation: {e}", file=sys.stderr)
+        traceback.print_exc()
+
+
+@app.post("/eval", response_model=EvalResponse)
+async def eval_submission(query_body: EvalRequest, request: Request):
+    '''Evaluate the submitted notebook by grading all questions using the scoring agent'''
+    
+    runner= runner_score
+
+    #if 'user' not in request.session:
+    #    raise HTTPException(status_code=401, detail="User not authenticated. #Please login first.")
+
+    try:
+
+        if not query_body.user_name or not  query_body.user_email or not query_body.answer_notebook or not query_body.rubric_link or not query_body.answer_hash:
+            raise HTTPException(status_code=400, detail="Incomplete request. Please provide user_name, user_email, answer_notebook, asnwer_hash and rubric_link")
+        
+        #user_id = request.session['user']['id']
+        #user_name = request.session['user']['name']
+
+        user_email = query_body.user_email 
+        user_name = query_body.user_name
+
+        answer_notebook = query_body.answer_notebook
+        answer_hash = query_body.answer_hash
+        rubric_link = query_body.rubric_link
 
         try:
-            # Attempt to get the response using the current session ID
-            response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
-        except ValueError as e:
-            # This error indicates the session ID in the cookie is stale or invalid.
-            if "Session not found" in str(e):
-                print(f"Stale session ID '{session_id}' detected. Creating and retrying with a new session.")
-                # Create a new session ID
-                new_session_id = str(uuid.uuid4())
-                # Explicitly create the new session in the database before using it.
-                await session_service.create_session(
-                    app_name=runner.app_name,
-                    user_id=user_id,
-                    session_id=new_session_id
-                )
-                request.session['agent_session_id'] = new_session_id
-                response_text = await run_agent_and_get_response(new_session_id, user_id, content,runner)
-            else:
-                # Re-raise any other ValueError that is not a session not found error.
-                raise
+            # .ipynb files are JSON, so we can return them as JSON
+            answer_json = json.loads(answer_notebook)
+            #print(json.dumps(answer_notebook, indent=2))
+                #return JSONResponse(content=notebook_json)
+        except json.JSONDecodeError:
+            # Or return as plain text if it's not valid JSON for some reason
+            return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n</pre>")
 
-        if not response_text:
-            raise HTTPException(status_code=500, detail="Failed to generate response")
+        google_user_name = answer_json['ipynb']['cells'][1]['metadata']['executionInfo']['user']['displayName']
+        google_user_id = answer_json['ipynb']['cells'][1]['metadata']['executionInfo']['user']['userId']
 
-        #print(f"Agent response: {response_text}")
+        add_user_if_not_exists(db, google_user_id, user_name, user_email, google_user_name)
 
-        return QueryResponse(
-            response=response_text
+        add_answer_notebook(db, google_user_id, query_body.notebook_id, answer_notebook, answer_hash)
+
+        # Read rubric notebook using the application's service account, not the logged-in user's credentials.
+        #print(f"rubric link is {query_body.rubric_link}")
+        rubric_content = await asyncio.to_thread(
+            load_notebook_from_google_drive_sa, firestore_cred_dict, str(rubric_link)
+        )
+        if rubric_content is None:
+            raise HTTPException(
+                status_code=404, detail=f"Rubric notebook '{rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
             )
+        try:
+            # .ipynb files are JSON, so we can return them as JSON
+            rubric_json = json.loads(rubric_content)
+            #print(json.dumps(rubri_jsocn, indent=2))
+            #return JSONResponse(content=rubric_json)
+        except json.JSONDecodeError:
+            # Or return as plain text if it's not valid JSON for some reason
+            return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n</pre>")
+        #
+
+        #print(f"Rubric notebook successfully loaded as {rubric_json}")
+
+        try: 
+            total_marks,max_marks,num_questions,graded = await evaluate(answer_json, rubric_json, runner, request, google_user_id)
+
+            print(f"{google_user_name}: Evaluation completed. Total Marks: {total_marks}/{max_marks} for {num_questions} questions.")
+            #print(f"Graded details: {graded}")
+
+            graded_string = json.dumps(graded, indent=2)
+            update_marks(db, google_user_id, query_body.notebook_id, total_marks, max_marks, graded_string)
+
+            return EvalResponse(
+                response=google_user_name + ": You have successfully submitted notebook for evaluation. Graded answer will be sent to your email.",
+                marks = 0.0
+            )
+        except Exception as e:
+            # By logging the exception with its traceback, you can see the root cause in your server logs.
+            logging.error("An exception occurred during query processing: %s", e)
+            traceback.print_exc()
 
     except KeyError:
         raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
@@ -755,10 +1190,10 @@ async def profile(request: Request):
         return {"error": "Not logged in"}
     return {"user_id": user_id, "username": user_name}
     
-@app.get("/ask", response_class=HTMLResponse)
-async def ask(request:Request):
-    ''' serves a simple form for testing access to agent, updation of database etc'''
-    return HTMLResponse(content=ask_form, status_code=200)
+#@app.get("/ask", response_class=HTMLResponse)
+#async def ask(request:Request):
+#    ''' serves a simple form for testing access to agent, updation of database #etc'''
+#    return HTMLResponse(content=ask_form, status_code=200)
 
 
 

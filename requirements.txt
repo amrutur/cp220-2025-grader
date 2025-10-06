@@ -7,3 +7,4 @@ firebase-admin
 google-cloud-secret-manager>=2.24.0
 itsdangerous
 google-auth-oauthlib
+pytz

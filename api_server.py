@@ -69,7 +69,7 @@ import datetime
 import pytz
 
 # Set the overall logging level to DEBUG
-#logging.basicConfig(level=logging.INFO)
+#logging.basicConfig(level=logging.DEBUG)
 
 # Set specific loggers for Starlette/ADK to DEBUG if needed
 #logging.getLogger("uvicorn").setLevel(logging.INFO)
@@ -670,22 +670,6 @@ async def run_agent_and_get_response(current_session_id: str, user_id: str, cont
         new_message=content,
     )
 
-    #print(f"Trace-id={response_stream.trace_id}")
-
-    try:
-        # 1. Convert the memory object to a dictionary (most ADK-style objects support this)
-        memory_contents = dict(runner.memory.items())  # Accessing items() for dict-like behavior
-    
-        # 2. Print using JSON for clean, formatted output
-        print("--- FULL AGENT ARTIFACTS (MEMORY) DUMP ---")
-        print(json.dumps(memory_contents, indent=4))
-        print("------------------------------------------")
-
-    except AttributeError:
-        # Fallback in case the memory object requires a specific getter method (e.g., .to_dict())
-        print("Could not directly convert memory to dict. Check ADK documentation for .to_dict() or equivalent.")
-
-
     text = ""
     async for event in response_stream:
         if event.content and event.content.parts:
@@ -694,6 +678,9 @@ async def run_agent_and_get_response(current_session_id: str, user_id: str, cont
                 #print(f"Received part: {part.text}")
         if event.is_final_response():
             break
+
+    
+    print(f"Final aggregated response: {text}")
     return text
 
 @app.post("/assist", response_model=AssistResponse)
@@ -710,24 +697,34 @@ async def assist(query_body: AssistRequest, request: Request):
 
    # print("Processing Query")
     runner = runner_assist
+    user_id = query_body.user_email if query_body.user_email else "anonymous_user"
+    user_name = query_body.user_name if query_body.user_name else "Anonymous User"
 
     #if 'user' not in request.session:
     #    raise HTTPException(status_code=401, detail="User not authenticated. #Please login first.")
 
     try:
         # Use a consistent session ID for the agent conversation
-        #print(request.session)
-        session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
-        request.session['agent_session_id'] = session_id
+        #print(f"Assist called. Session is {request.session}")
+        if 'agent_session_id' in request.session:
+            session_id = request.session.get('agent_session_id')
+        else:
+            session_id = str(uuid.uuid4())
+            request.session['agent_session_id'] = session_id
+            await session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=user_id,
+                    session_id=session_id
+                )
+
+        #print(f"Assist updated with: Session = {request.session}")
 
         #user_id = request.session['user']['id']
         #user_name = request.session['user']['name']
 
-        user_id = query_body.user_email if query_body.user_email else "anonymous_user"
-        user_name = query_body.user_name if query_body.user_name else "Anonymous User"
 
 
-        #print(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
+        #print(f"User has asked for assistance for question {query_body.q_id}")        
         rubric = ''
         #print(f"content is {content}")
         if query_body.rubric_link:
@@ -780,7 +777,7 @@ async def assist(query_body: AssistRequest, request: Request):
         if not response_text:
             raise HTTPException(status_code=500, detail="Failed to generate response")
 
-        print(f"Agent response: {response_text}")
+        #print(f"Agent response: {response_text}")
 
         return AssistResponse(
             response=response_text

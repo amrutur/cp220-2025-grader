@@ -40,7 +40,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import uvicorn
 from dotenv import load_dotenv
-from pydantic import BaseModel, AnyUrl
+from pydantic import BaseModel, AnyUrl, EmailStr
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import RedirectResponse
 
@@ -64,15 +64,42 @@ from firebase_admin import credentials, firestore
 
 import io
 import re
-from typing import  Dict, Any
+from typing import  Dict, List, Any
 import datetime
 import pytz
 
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+import base64
+from email.mime.text import MIMEText
+
+#logging configuration
+
+
+# 1. Define the format for the logs
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s] - %(message)s')
+
+# 2. Create a Console Handler (outputs to terminal/console)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+console_handler.setLevel(logging.INFO) # Only show INFO, WARNING, ERROR on console
+
+# 3. Create a File Handler (outputs to a log file)
+file_handler = logging.FileHandler('app.log', mode='a')
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.DEBUG) # Show all DEBUG messages in the file
+
+# 4. Get the root logger and attach the handlers
+root_logger = logging.getLogger()
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+
 # Set the overall logging level to DEBUG
 #logging.basicConfig(level=logging.DEBUG)
+root_logger.setLevel(logging.DEBUG)
+
 
 # Set specific loggers for Starlette/ADK to DEBUG if needed
-#logging.getLogger("uvicorn").setLevel(logging.INFO)
 #logging.getLogger("starlette").setLevel(logging.INFO)
 #logging.getLogger("google_adk").setLevel(logging.DEBUG) 
 
@@ -206,6 +233,17 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
+
+
+# Authenticate
+GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+gmail_flow = InstalledAppFlow.from_client_secrets_file('credentials.json', GMAIL_SCOPES)
+gmail_creds = gmail_flow.run_local_server(port=0)
+
+# Build Gmail service
+email_service = build('gmail', 'v1', credentials=gmail_creds)
+
+
 client_config = config["client_config"]
 signing_secret_key = config["signing_secret_key"]
 REDIRECT_URI_INDEX = config["redirect_uri_index"]
@@ -236,109 +274,6 @@ runner_score = Runner(
     session_service=session_service
 )
 
-#  This HTML includes JavaScript to handle the form submission.
-#  This is being used  by the /ask endpoint to help test /query endpoint
-#  by mimicing what would be sent from the google colab notebook
-ask_form = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mimic inputs as if from the notebook cell for checking answer</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #f4f4f9; }
-        .container { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 100%; max-width: 400px; }
-        h2 { text-align: center; color: #333; }
-        form { display: flex; flex-direction: column; gap: 1rem; }
-        label { font-weight: 500; color: #555; }
-        input[type="text"] { padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; font-size: 1rem; }
-        input[type="text"]:focus { outline: none; border-color: #007bff; box-shadow: 0 0 0 2px rgba(0,123,255,0.25); }
-        button { padding: 0.75rem; background-color: #007bff; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; transition: background-color 0.2s; }
-        button:hover { background-color: #0056b3; }
-        #response-container { margin-top: 1.5rem; padding: 1rem; background-color: #e9ecef; border-radius: 4px; display: none; }
-        pre { white-space: pre-wrap; word-wrap: break-word; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>Mimic inputs from notebook asnwer cell's check answer button</h2>
-        <form id="ask-form">
-            <div>
-                <label for="input1">Question and  Answer:</label>
-                <input type="text" id="input1" name="input1" placeholder="Question: question asked in the cell. Answer: answer provided by stdt" required>
-            </div>
-            <div>
-                <label for="input2">Course No:</label>
-                <input type="text" id="input2" name="input2" placeholder="Enter Course No" required>
-            </div>
-            <div>
-                <label for="input3">Notebook name:</label>
-                <input type="text" id="input3" name="input3" placeholder="Enter notebook name" required>
-            </div>
-           <div>
-                <label for="input4">Question Id:</label>
-                <input type="text" id="input4" name="input4" placeholder="Enter Question ID" required>
-            </div>
-
-            <div>
-                <label for="input5">Rubric Link:</label>
-                <input type="text" id="input5" name="input5" placeholder="Enter rubric file link (optional)">
-            </div>
-
-            <button type="submit">Check</button>
-        </form>
-        <div id="response-container">
-            <strong>Response:</strong>
-            <pre id="api-response"></pre>
-        </div>
-    </div>
-
-    <script>
-        document.getElementById('ask-form').addEventListener('submit', async function(event) {
-            event.preventDefault(); // Stop the default page reload
-
-            const formData = new FormData(this);
-            const data = {
-                query: formData.get('input1'),
-                course_name: formData.get('input2'),
-                notebook_name: formData.get('input3'),
-                q_name: formData.get('input4'),
-                rubric_link: formData.get('input5')
-            };
-
-            try {
-                const response = await fetch('/query', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-
-                if (!response.ok) {
-                    throw new Error(`HTTP Error! query: ${data.query} course_name:${data.course_name} notebook_name: ${data.notebook_name} q_name:${data.q_name} Status: ${response.status}`);
-                }
-
-                const result = await response.json();
-
-                // Display the response from the server
-                const responseContainer = document.getElementById('response-container');
-                const apiResponseElement = document.getElementById('api-response');
-                apiResponseElement.textContent = JSON.stringify(result, null, 2);
-                responseContainer.style.display = 'block';
-
-            } catch (error) {
-                console.error('Error:', error);
-                document.getElementById('api-response').textContent = `Error: ${error.message}`;
-                document.getElementById('response-container').style.display = 'block';
-            }
-        });
-    </script>
-</body>
-</html>
-"""
-
-
-
 def credentials_to_dict(credentials):
     """Helper function to convert Google credentials to a dictionary."""
     return {'token': credentials.token,
@@ -355,6 +290,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
     "https://www.googleapis.com/auth/drive.readonly",  # Add scope to read Google Drive files
+    'https://www.googleapis.com/auth/gmail.send', #send email
 ]
 
 class QueryRequest(BaseModel):
@@ -399,7 +335,7 @@ class EvalRequest(BaseModel):
     user_name: str 
     user_email: str
     notebook_id: str
-    answer_notebook: str
+    answer_notebook: Dict[str, Any]
     answer_hash: str
     rubric_link: AnyUrl
 
@@ -408,7 +344,26 @@ class EvalResponse(BaseModel):
     response: str
     marks: float
 
+class FetchGradedRequest(BaseModel):
+    notebook_id: str
+    user_email: EmailStr
 
+class FetchGradedResponse(BaseModel):
+    grader_response: Dict[str, Any] | None = None
+
+class NotifyGradedRequest(BaseModel):
+    notebook_id: str
+    user_email: EmailStr
+
+class NotifyGradedResponse(BaseModel):
+    response: str
+
+class FetchStudentListRequest(BaseModel):
+    course_id:str | None = None
+    notebook_id: str | None = None
+
+class FetchStudentListResponse(BaseModel):
+    response: Dict[str, Any]| None = None
 
 def get_user_list(db):
     '''return the list of users in the firestore database'''
@@ -426,7 +381,7 @@ def add_user_if_not_exists(db, google_user_id, user_name, user_email, google_use
     user_list = get_user_list(db)
 
     if google_user_id not in user_list:
-        print(f"User '{user_name}' ({google_user_id}) not in database. Adding now.")
+        logging.info(f"User '{user_name}' ({google_user_id}) not in database. Adding now.")
         user_ref = db.collection(u'users').document(google_user_id)
         user_ref.set({
             u'name': user_name,
@@ -444,8 +399,8 @@ def add_answer_notebook(db, google_user_id, notebook_id, answer_notebook, answer
             u'submitted_at': firestore.SERVER_TIMESTAMP      
         })
     except Exception as e:
-        print(f"Error adding answer notebook to Firestore: {e}", file=sys.stderr)
-        traceback.print_exc()
+        logging.error(f"Error adding answer notebook to Firestore: {e}")
+        #traceback.print_exc()
 
 def update_marks(db, google_user_id, notebook_id, total_marks, max_marks,graded):
     '''update the marks for the answer notebook of google_user_id in the firestore database'''
@@ -461,8 +416,9 @@ def update_marks(db, google_user_id, notebook_id, total_marks, max_marks,graded)
             u'graded': graded
         },merge=True)
     except Exception as e:
-        print(f"Error updating marks in Firestore: {e}", file=sys.stderr)
-        traceback.print_exc()
+        logging.error(f"Error updating marks in Firestore: {e}")
+        #traceback.print_exc()
+
 
 app = FastAPI(title="CP220-2025 Agent API")
 
@@ -680,7 +636,7 @@ async def run_agent_and_get_response(current_session_id: str, user_id: str, cont
             break
 
     
-    print(f"Final aggregated response: {text}")
+    #print(f"Final aggregated response: {text}")
     return text
 
 @app.post("/assist", response_model=AssistResponse)
@@ -697,7 +653,12 @@ async def assist(query_body: AssistRequest, request: Request):
 
    # print("Processing Query")
     runner = runner_assist
-    user_id = query_body.user_email if query_body.user_email else "anonymous_user"
+
+    if ('user' in request.session) : #user is logged and authenticated
+        user_id = request.session['user']['id']
+    else:
+        user_id = query_body.user_email if query_body.user_email else "anonymous_user"
+
     user_name = query_body.user_name if query_body.user_name else "Anonymous User"
 
     #if 'user' not in request.session:
@@ -705,7 +666,7 @@ async def assist(query_body: AssistRequest, request: Request):
 
     try:
         # Use a consistent session ID for the agent conversation
-        #print(f"Assist called. Session is {request.session}")
+
         if 'agent_session_id' in request.session:
             session_id = request.session.get('agent_session_id')
         else:
@@ -717,16 +678,8 @@ async def assist(query_body: AssistRequest, request: Request):
                     session_id=session_id
                 )
 
-        #print(f"Assist updated with: Session = {request.session}")
-
-        #user_id = request.session['user']['id']
-        #user_name = request.session['user']['name']
-
-
-
-        #print(f"User has asked for assistance for question {query_body.q_id}")        
         rubric = ''
-        #print(f"content is {content}")
+
         if query_body.rubric_link:
             # Read rubric notebook using the application's service account, not the logged-in user's credentials.
             #print(f"rubric link is {query_body.rubric_link}")
@@ -745,7 +698,7 @@ async def assist(query_body: AssistRequest, request: Request):
                 #return JSONResponse(content=notebook_json)
             except json.JSONDecodeError:
                 # Or return as plain text if it's not valid JSON for some reason
-                return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
+                return HTMLResponse(content=f"<pre>Could not parse rubric notebook as JSON. Raw content:\n\n{notebook_content}</pre>")
             rubric =  "The rubric is: " + ''.join(notebook_json['cells'][q_id+1]['source'])
         # Create a message from the query
         content = types.Content(
@@ -753,38 +706,16 @@ async def assist(query_body: AssistRequest, request: Request):
             parts=[types.Part.from_text(text=query_body.query+rubric)]
         )
 
-        try:
-            # Attempt to get the response using the current session ID
-            response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
-        except ValueError as e:
-            # This error indicates the session ID in the cookie is stale or invalid.
-            if "Session not found" in str(e):
-                print(f"Stale session ID '{session_id}' detected. Creating and retrying with a new session.")
-                # Create a new session ID
-                new_session_id = str(uuid.uuid4())
-                # Explicitly create the new session in the database before using it.
-                await session_service.create_session(
-                    app_name=runner.app_name,
-                    user_id=user_id,
-                    session_id=new_session_id
-                )
-                request.session['agent_session_id'] = new_session_id
-                response_text = await run_agent_and_get_response(new_session_id, user_id, content,runner)
-            else:
-                # Re-raise any other ValueError that is not a session not found error.
-                raise
+        # Attempt to get the response using the current session ID
+        response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
 
         if not response_text:
             raise HTTPException(status_code=500, detail="Failed to generate response")
-
-        #print(f"Agent response: {response_text}")
 
         return AssistResponse(
             response=response_text
             )
 
-    except KeyError:
-        raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
     except Exception as e:
         # By logging the exception with its traceback, you can see the root cause in your server logs.
         logging.error("An exception occurred during query processing: %s", e)
@@ -813,7 +744,7 @@ async def process_query(query_body: QueryRequest, request: Request):
 
     try:
         # Use a consistent session ID for the agent conversation
-        print(request.session)
+        #logging.info(request.session)
         session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
         request.session['agent_session_id'] = session_id
 
@@ -829,12 +760,11 @@ async def process_query(query_body: QueryRequest, request: Request):
             parts=[types.Part.from_text(text=query_body.query)]
         )
 
-        print(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
+        logging.info(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
 
-        #print(f"content is {content}")
         if query_body.rubric_link:
             # Read rubric notebook using the application's service account, not the logged-in user's credentials.
-            print(f"rubric link is {query_body.rubric_link}")
+            #print(f"rubric link is {query_body.rubric_link}")
             notebook_content = await asyncio.to_thread(
                 load_notebook_from_google_drive_sa, firestore_cred_dict, str(query_body.rubric_link)
             )
@@ -877,7 +807,7 @@ async def process_query(query_body: QueryRequest, request: Request):
         if not response_text:
             raise HTTPException(status_code=500, detail="Failed to generate response")
 
-        print(f"Agent response: {response_text}")
+        #print(f"Agent response: {response_text}")
 
         return QueryResponse(
             response=response_text
@@ -912,11 +842,17 @@ async def score_question(question:str, answer:str, rubric:str, runner:Runner, re
 
     try:
 
-        # Use a consistent session ID for the agent conversation
-        session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
+        #create a new session to avoid any context carryover
+        session_id = str(uuid.uuid4())
         request.session['agent_session_id'] = session_id
+        await session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=user_id,
+                    session_id=session_id
+            )
 
-        question = "The question asked is: " + question + "."
+
+        question = "The assignment question is: " + question + "."
         answer = "The student's answer is: " + answer + "."
         rubric = "The rubric is: " + rubric +"."
 
@@ -928,35 +864,23 @@ async def score_question(question:str, answer:str, rubric:str, runner:Runner, re
 
         # Attempt to get the response using the current session ID
         response_text = await run_agent_and_get_response(session_id,user_id, content,runner)
-    except ValueError as e:
-        # This error indicates the session ID in the cookie is stale or invalid.
-        if "Session not found" in str(e):
-            print(f"Stale session ID '{session_id}' detected. Creating and retrying with a new session.")
-            # Create a new session ID
-            new_session_id = str(uuid.uuid4())
-            # Explicitly create the new session in the database before using it.
-            await session_service.create_session(
-                app_name=runner.app_name,
-                user_id=user_id,
-                session_id=new_session_id
-            )
-            #request.session['agent_session_id'] = new_session_id
-            response_text = await run_agent_and_get_response(new_session_id, user_id, content,runner)
-        else:
-            # Re-raise any other ValueError that is not a session not found error.
-            raise
+
+    except Exception as e:
+        logging.error(f"Error in score_question: {e}")
+        raise HTTPException(status_code=500, detail=f"An internal error occurred while scoring: {e}")
 
     if not response_text:
         raise HTTPException(status_code=500, detail="Agent failed to generate response")
 
+
     #extract the marks from the response text
     marks = 0.0
-    marks_pattern = r"The\s+total\s+marks\s+is\s+(\d+\.?\d*)"
+    marks_pattern = r"total\s+marks\D+(\d+\.?\d*)"
     marks_match = re.search(marks_pattern, response_text, re.IGNORECASE)
     if marks_match:
         marks = float(marks_match.group(1))
     else:
-        print("Could not extract marks from the agent's response. Defaulting to 0.0")
+        raise HTTPException(status_code=500, detail="Agent failed to extract marks")
 
     return marks, response_text
 
@@ -969,17 +893,27 @@ async def grade(query_body: GradeRequest, request: Request):
     #if 'user' not in request.session:
     #    raise HTTPException(status_code=401, detail="User not authenticated. #Please login first.")
 
+    if ('user' in request.session) : #user is logged and authenticated
+        user_id = request.session['user']['id']
+    else:
+        user_id = query_body.user_email if query_body.user_email else "anonymous_user"
+
+    user_name = query_body.user_name if query_body.user_name else "Anonymous User"
+
+
     try:
         # Use a consistent session ID for the agent conversation
-        #print(request.session)
-        session_id = request.session.get('agent_session_id', str(uuid.uuid4()))
-        request.session['agent_session_id'] = session_id
 
-        #user_id = request.session['user']['id']
-        #user_name = request.session['user']['name']
-
-        user_id = query_body.user_email if query_body.user_email else "Null@Null"
-        user_name = query_body.user_name if query_body.user_name else "Anonymous"
+        if 'agent_session_id' in request.session:
+            session_id = request.session.get('agent_session_id')
+        else:
+            session_id = str(uuid.uuid4())
+            request.session['agent_session_id'] = session_id
+            await session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=user_id,
+                    session_id=session_id
+                )
 
         if not query_body.question:
             raise HTTPException(status_code=400, detail="Question not provided")
@@ -995,8 +929,6 @@ async def grade(query_body: GradeRequest, request: Request):
             marks = marks
         )
 
-    except KeyError:
-        raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
     except Exception as e:
         # By logging the exception with its traceback, you can see the root cause in your server logs.
         logging.error("An exception occurred during query processing: %s", e)
@@ -1007,13 +939,13 @@ async def grade(query_body: GradeRequest, request: Request):
 async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, user_id: str)-> tuple[float,float,int,dict]:
     '''Evaluate the submitted notebook by grading all questions using the scoring agent'''
     try:
-        acells = answer_json['ipynb']['cells']
+        acells = answer_json['cells']
         rcells = rubric_json['cells']
         total_marks = 0.0
         max_marks = 0.0
         num_questions = 0
 
-        qpattern = r"\*\*Q(\d+)\*\*.*\((\d+\.?\d*)"
+        qpattern = r"\*\*Q(\d+)\*\*\s*\((\d+\.?\d*)"
 
         #extract the questions from the rubric cells and match with the answer cells
         i = 0
@@ -1021,6 +953,7 @@ async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, us
         rubrics={}
         graded={} #graders response and marks
         #print(f"Total cells in rubric notebook: {len(rcells)}")
+        qmax_marks = {}
         while i < len(rcells) :
             if rcells[i]['cell_type'] == 'markdown':
                 #check if it is a question cell
@@ -1029,10 +962,11 @@ async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, us
                 if qmatch:
                     qnum = int(qmatch.group(1))
                     qmarks = float(qmatch.group(2))
+                    qmax_marks[qnum]=qmarks
                     max_marks += qmarks
                     num_questions += 1
                     questions[qnum]=''.join(rcells[i].get('source', []))
-                    #print(f"Cell {i} qnum={qnum} with max marks {qmarks}")
+                    logging.debug(f"Cell {i} qnum={qnum} with max marks {qmarks}")
                     i += 1
                     #next cell should be the rubric cell
                     if i < len(rcells):
@@ -1041,7 +975,7 @@ async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, us
                         raise Exception(f"Rubric cell missing after question {qnum}")
                 
             i += 1
-        print(f"Extracted {num_questions} questions from rubric notebook with total marks {max_marks}. Now grading answers.")
+        logging.info(f"Extracted {num_questions} questions from rubric notebook with total marks {max_marks}. Now grading answers.")
         i=0
         while i < len(acells):
             #rint(f"Checking answer cell {i} for question pattern")
@@ -1055,11 +989,14 @@ async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, us
                         answer=''.join(acells[i].get('source', []))
                     else:
                         answer="No answer provided."
-                    #print(f"scoring question {qnum} for user {user_id}")
-                    #print(f"Question: {questions[qnum]}")
+                    logging.debug(f"scoring question {qnum} for user {user_id}")
+                    logging.debug(f"Question: {questions[qnum]}")
                     marks, response_text = await score_question(questions[qnum], answer, rubrics[qnum], runner, request, user_id)
                     total_marks += marks
                     graded[qnum] = {'marks': marks, 'response': response_text}
+                    logging.info(f"Graded question {qnum}: awarded {marks}/{qmax_marks[qnum]} marks.")
+                    if marks > qmax_marks[qnum]:
+                        logging.error(f"Error: Awarded marks {marks} exceeds maximum {qmax_marks[qnum]} for question {qnum}.")
             i += 1
         return total_marks, max_marks, num_questions, graded
 
@@ -1074,9 +1011,6 @@ async def eval_submission(query_body: EvalRequest, request: Request):
     
     runner= runner_score
 
-    #if 'user' not in request.session:
-    #    raise HTTPException(status_code=401, detail="User not authenticated. #Please login first.")
-
     try:
 
         if not query_body.user_name or not  query_body.user_email or not query_body.answer_notebook or not query_body.rubric_link or not query_body.answer_hash:
@@ -1088,34 +1022,58 @@ async def eval_submission(query_body: EvalRequest, request: Request):
         user_email = query_body.user_email 
         user_name = query_body.user_name
 
-        answer_notebook = query_body.answer_notebook
+        answer_notebook = query_body.answer_notebook          
         answer_hash = query_body.answer_hash
         rubric_link = query_body.rubric_link
 
         try:
             # .ipynb files are JSON, so we can return them as JSON
-            answer_json = json.loads(answer_notebook)
-            #print(json.dumps(answer_notebook, indent=2))
-                #return JSONResponse(content=notebook_json)
+            #answer_json = json.loads(answer_notebook)
+            answer_json = answer_notebook
         except json.JSONDecodeError:
             # Or return as plain text if it's not valid JSON for some reason
             return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n</pre>")
 
-        google_user_name = answer_json['ipynb']['cells'][1]['metadata']['executionInfo']['user']['displayName']
-        google_user_id = answer_json['ipynb']['cells'][1]['metadata']['executionInfo']['user']['userId']
+
+        #extract the cells from the notebook
+        if ('ipynb' in answer_json): #remove one hierarchy if present
+            answer_json = answer_json['ipynb']
+        
+        answer_cells = answer_json['cells'] if 'cells' in answer_json else []
+        #print(f"answr cell 1 is {answer_cells[1]}")
+        #extract google validated name, and id.
+        #This is stored in the metadata of the execution info for any code  cell of the notebook
+        for i in range(len(answer_cells)):
+            cell = answer_cells[i]
+            if cell['cell_type'] == 'code' and  cell['metadata']['executionInfo']['status'] == 'ok':
+                    google_user_name = cell['metadata']['executionInfo']['user']['displayName']
+                    google_user_id = cell['metadata']['executionInfo']['user']['userId']
+                    break
+
+        if not google_user_name:
+            google_user_name = "Unknown"
+            google_user_id = "Unknown"
+            logging.warning("Warning: Could not extract google user name and id from notebook metadata.Need to run at least one code cell")
+
+        #Temporary DEBUG
+        if (re.search(r'Amrutur',google_user_name,re.IGNORECASE)):
+            google_user_name = user_name
+            google_user_id = user_email
+    
+        logging.info(f"google_user_name={google_user_name}, google_user_id={google_user_id}")
 
         add_user_if_not_exists(db, google_user_id, user_name, user_email, google_user_name)
 
         add_answer_notebook(db, google_user_id, query_body.notebook_id, answer_notebook, answer_hash)
 
         # Read rubric notebook using the application's service account, not the logged-in user's credentials.
-        #print(f"rubric link is {query_body.rubric_link}")
+        logging.info(f"rubric link is {query_body.rubric_link}")
         rubric_content = await asyncio.to_thread(
             load_notebook_from_google_drive_sa, firestore_cred_dict, str(rubric_link)
         )
         if rubric_content is None:
             raise HTTPException(
-                status_code=404, detail=f"Rubric notebook '{rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
+                status_code=404, detail=f"{user_name:user_email} Rubric notebook '{rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
             )
         try:
             # .ipynb files are JSON, so we can return them as JSON
@@ -1132,7 +1090,7 @@ async def eval_submission(query_body: EvalRequest, request: Request):
         try: 
             total_marks,max_marks,num_questions,graded = await evaluate(answer_json, rubric_json, runner, request, google_user_id)
 
-            print(f"{google_user_name}: Evaluation completed. Total Marks: {total_marks}/{max_marks} for {num_questions} questions.")
+            logging.info(f"{google_user_name}: Evaluation completed. Total Marks: {total_marks}/{max_marks} for {num_questions} questions.")
             #print(f"Graded details: {graded}")
 
             graded_string = json.dumps(graded, indent=2)
@@ -1177,6 +1135,141 @@ async def root():
     """
     return HTMLResponse(content=html_content, status_code=200)
 
+def fetch_grader_response(db, notebook_id:str=None, user_email:str=None):
+    '''
+    get the graded answer for the student user_email for notebook_id in the firestore database
+    '''
+
+    logging.debug(f"Fetching grader response for email: {user_email} and notebook_id: {notebook_id}")
+
+    try:
+        user_list = get_user_list(db)
+        grader_response={}
+
+        if notebook_id is None:
+            logging.error(f"notebook_id is None")
+            return None
+        for user_id in user_list:
+            answer_ref = db.collection(u'users').document(user_id).collection(u'notebooks').document(notebook_id)
+            userinfo_ref = db.collection(u'users').document(user_id)
+            logging.debug(f"Fetched userinfo_ref for {user_email}")
+            userinfo_doc = userinfo_ref.get()
+            logging.debug(f"Fetched userinfo_doc for {userinfo_doc.get('name')} with {userinfo_doc.get('email')} ")
+            answer_doc = answer_ref.get()
+            logging.debug(f"Checking user: {userinfo_doc.get('name')} with {userinfo_doc.get('email')} ")
+            if  re.match(f"{user_email}",userinfo_doc.get('email'),re.IGNORECASE) is None:
+                logging.debug(f"No match for email {user_email} and {userinfo_doc.get('email')}")
+                continue
+            logging.debug(f"Found matching user: {userinfo_doc.get('name')} with {userinfo_doc.get('email')} ")
+
+            user_name = userinfo_doc.get('name')
+            logging.debug(f"Fetching graded response for user: {user_name} and notebook_id: {notebook_id}")
+            response_json = answer_doc.to_dict()
+
+            logging.debug(f"user:{user_name} : total marks: {response_json.get('total_marks')} Response json: {response_json.get('graded')}")
+
+            grader_response = {'user_name':user_name, 'total_marks':response_json.get('total_marks'),'max_marks':response_json.get('max_marks')}
+
+            grader_response['feedback'] = json.loads(response_json.get('graded'))
+            logging.debug(f"For  matching user, response is: {grader_response}")
+            break
+        return grader_response
+    except Exception as e:
+        logging.error(f"Error in fetch_grader_response: {e}")
+        #traceback.print_exc()
+
+@app.post("/fetch_grader_response", response_model=FetchGradedResponse)
+async def fetch_grader_response_api(query_body: FetchGradedRequest, request: Request):
+    '''Fetch the graded response for a student from the database'''
+    try:
+
+        if not query_body.notebook_id:
+            raise HTTPException(status_code=400, detail="notebook_id not provided")
+
+        if not query_body.user_email:
+            raise HTTPException(status_code=400, detail="user_email not provided")
+
+        user_email = query_body.user_email
+
+        logging.debug(f"Fetching grader response for email: {user_email} and notebook_id: {query_body.notebook_id}")
+        grader_response = fetch_grader_response(db, notebook_id=query_body.notebook_id, user_email=user_email)
+        #logging.debug(f"Fetched grader response: {grader_response}")
+        if not grader_response:
+            raise HTTPException(status_code=404, detail="No graded response found")
+
+        return FetchGradedResponse(
+            grader_response=grader_response
+        )
+
+    except Exception as e:
+        # By logging the exception with its traceback, you can see the root cause in your server logs.
+        logging.error("An exception occurred during fetch_grader_response_api: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+# Send email
+def send_email(email_service, to, subject, body):
+    message = MIMEText(body)
+    message['to'] = to
+    message['subject'] = subject
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    
+    try:
+        sent = email_service.users().messages().send(
+            userId='me',
+            body={'raw': raw}
+        ).execute()
+        print(f"Email sent! Message ID: {sent['id']}")
+        return sent
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+
+@app.post("/notify_student_grades", response_model=NotifyGradedResponse)
+async def notify_student_grades_api(query_body: NotifyGradedRequest, request: Request):
+    '''Fetch the graded response for a student from the database'''
+    try:
+
+
+        if not query_body.notebook_id:
+            raise HTTPException(status_code=400, detail="notebook_id not provided")
+
+        if not query_body.user_email:
+            raise HTTPException(status_code=400, detail="user_email not provided")
+
+        user_email = query_body.user_email
+
+        grader_response = fetch_grader_response(db, notebook_id=query_body.notebook_id, user_email=user_email)
+        #logging.debug(f"Fetched grader response: {grader_response}")
+        if not grader_response:
+            raise HTTPException(status_code=404, detail="No graded response found")
+
+        user_name = grader_response.get('user_name', 'Student')
+        total_marks = grader_response.get('total_marks', 0)
+        max_marks = grader_response.get('max_marks', 0)
+        subject = f"Graded Response for your submission {query_body.notebook_id}"
+        msg_body = f"Hello {user_name},\n\n Your marks in {query_body.notebook_id} is {total_marks} out of {max_marks}. \n\nDetailed feedback for your submission"
+
+        msg_body += json.dumps(grader_response, indent=4)
+
+        msg_body+="\n\nBest regards,\nCP220-2025 Grading Assistant"
+        
+        logging.debug(f"Sending email to {user_email} with subject '{subject}' and body:\n{msg_body}")
+        
+        send_email(email_service, user_email, subject, msg_body)
+    
+        return NotifyGradedResponse(
+            response=f"Sent email to {user_email} with graded response."
+        )
+
+    except Exception as e:
+        # By logging the exception with its traceback, you can see the root cause in your server logs.
+        logging.error("An exception occurred during notify_student_grades_api: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
 @app.get("/profile")
 async def profile(request: Request):
     # The middleware reads the cookie from the request and loads the session data.
@@ -1187,10 +1280,44 @@ async def profile(request: Request):
         return {"error": "Not logged in"}
     return {"user_id": user_id, "username": user_name}
     
-#@app.get("/ask", response_class=HTMLResponse)
-#async def ask(request:Request):
-#    ''' serves a simple form for testing access to agent, updation of database #etc'''
-#    return HTMLResponse(content=ask_form, status_code=200)
+
+@app.post("/fetch_student_list", response_model=FetchStudentListResponse)
+async def fetch_student_list_api(query_body: FetchStudentListRequest, request: Request):
+    '''
+    Fetch the lst of  students from the database
+    returns a dictionary of user_id to name and email  
+    '''
+    try:
+
+        user_list = get_user_list(db)
+        student_list = {}
+        for user_id in user_list:
+            userinfo_doc = db.collection(u'users').document(user_id).get()
+            if userinfo_doc.exists:
+                student_list[user_id]={'name': userinfo_doc.to_dict().get('name', 'Unknown'),'email': userinfo_doc.to_dict().get('email', 'Unknown')}
+                if query_body.notebook_id is not None:
+                    #check if the student has submitted the notebook
+                    answer_doc = db.collection(u'users').document(user_id).collection(u'notebooks').document(query_body.notebook_id).get()
+                    if answer_doc.exists:
+                        student_list[user_id]['total_marks'] = answer_doc.to_dict().get('total_marks', 0.0)
+                        student_list[user_id]['max_marks'] = answer_doc.to_dict().get('max_marks', 0.0)
+                        student_list[user_id]['submitted'] = True
+                    else:
+                        student_list[user_id]['submitted'] = False
+            else:
+                logging.warning(f"User document for user_id {user_id} does not exist.")
+
+        #logging.debug(f"Fetched student list: {user_list} of {type(user_list)}")
+
+        return FetchStudentListResponse(
+            response=student_list
+        )
+
+    except Exception as e:
+        # By logging the exception with its traceback, you can see the root cause in your server logs.
+        logging.error("An exception occurred during fetch_student_list_api: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
 
 

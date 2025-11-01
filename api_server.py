@@ -572,9 +572,23 @@ async def login(request: Request):
     logging.info(f"Login: Using redirect URI: {client_config['web']['redirect_uris'][REDIRECT_URI_INDEX]}")
     logging.debug(f"Login: Session data after storing state: {dict(request.session)}")
 
-    response = RedirectResponse(authorization_url)
-    logging.info(f"Login: Redirecting to Google OAuth: {authorization_url[:80]}...")
-    return response
+    # Use HTML redirect to ensure session cookie is set before redirect
+    # Direct RedirectResponse can sometimes redirect before session middleware sets the cookie
+    html_content = f"""
+    <html>
+        <head>
+            <title>Redirecting to Google...</title>
+            <meta http-equiv="refresh" content="0;url={authorization_url}">
+        </head>
+        <body>
+            <p>Redirecting to Google for authentication...</p>
+            <p>If you are not redirected automatically, <a href="{authorization_url}">click here</a>.</p>
+        </body>
+    </html>
+    """
+
+    logging.info(f"Login: Redirecting to Google OAuth via HTML redirect: {authorization_url[:80]}...")
+    return HTMLResponse(content=html_content, status_code=200)
 
 @app.get("/callback", tags=["Authentication"])
 #async def oauth_callback(request: Request,client_config:dict = Depends(get_client_config)):

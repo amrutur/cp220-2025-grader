@@ -108,7 +108,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars "PRODUCTION=1" \
   --set-env-vars "FIRESTORE_DATABASE_ID=your-database-id" \
   --set-env-vars "INSTRUCTOR_EMAILS=instructor1@example.com,instructor2@example.com" \
-  --set-env-vars "GMAIL_SENDER_EMAIL=noreply@yourdomain.com" \
+  --set-env-vars "SENDGRID_FROM_EMAIL=noreply@yourdomain.com" \
   --set-env-vars "OAUTH_CLIENT_ID_KEY_NAME=oauth-client-id" \
   --set-env-vars "OAUTH_CLIENT_SECRET_KEY_NAME=oauth-client-secret" \
   --set-env-vars "SIGNING_SECRET_KEY_NAME=signing-secret" \
@@ -138,20 +138,20 @@ https://cp220-grader-api-zuqb5siaua-el.a.run.app
    ```
 5. Click **Save**
 
-## Step 6: Configure Gmail API (Optional but Recommended)
+## Step 6: Configure SendGrid for Email Notifications (Optional but Recommended)
 
-To enable email notifications for graded assignments, you need to configure Gmail API with domain-wide delegation.
+To enable email notifications for graded assignments, you need to set up SendGrid.
 
-**Note**: This requires **Google Workspace** (not regular Gmail).
+The SendGrid API key should already be stored in Secret Manager as `sendgrid-api-key`.
 
-See [GMAIL_SETUP.md](GMAIL_SETUP.md) for complete setup instructions.
-
-Quick summary:
-1. Enable Gmail API in Google Cloud Console
-2. Configure domain-wide delegation in Google Workspace Admin Console
-3. Set `GMAIL_SENDER_EMAIL` environment variable
+Quick steps:
+1. Verify the secret exists: `gcloud secrets describe sendgrid-api-key --project=$PROJECT_ID`
+2. Set `SENDGRID_FROM_EMAIL` environment variable (already done in Step 4)
+3. Verify the sender email in SendGrid dashboard
 
 If you skip this step, the application will work but email notifications won't be sent.
+
+See [SENDGRID_SETUP.md](SENDGRID_SETUP.md) for complete setup instructions.
 
 ## Step 7: Test Your Deployment
 
@@ -190,7 +190,7 @@ gcloud run deploy $SERVICE_NAME \
 | `PRODUCTION` | Set to 1 for production | `1` |
 | `FIRESTORE_DATABASE_ID` | Firestore database ID | `(default)` |
 | `INSTRUCTOR_EMAILS` | Comma-separated instructor emails | `prof@example.com,ta@example.com` |
-| `GMAIL_SENDER_EMAIL` | Email address to send from (requires Google Workspace + domain-wide delegation) | `noreply@yourdomain.com` |
+| `SENDGRID_FROM_EMAIL` | Email address to send from (must be verified in SendGrid) | `noreply@yourdomain.com` |
 | `OAUTH_REDIRECT_URI` | Optional custom redirect URI | Only for dev with ngrok |
 | Secret key environment variables (point to Secret Manager secrets) ||
 | `OAUTH_CLIENT_ID_KEY_NAME` | Name of secret containing OAuth client ID | `oauth-client-id` |

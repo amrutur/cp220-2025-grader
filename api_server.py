@@ -16,7 +16,7 @@ GOOGLE_CLOUD_PROECT (should be set to be the project id for the application goog
 PRODUCTION (should be set to 0 for local testing and 1 for production)
 INSTRUCTOR_EMAILS (comma-separated list of authorized instructor email addresses)
 OAUTH_REDIRECT_URI (optional, for development with ngrok - e.g., https://yoursubdomain.ngrok-free.app/callback)
-GMAIL_SENDER_EMAIL (email address to send emails from - must be in your Google Workspace domain)
+SENDGRID_FROM_EMAIL (email address to send emails from)
 
 In addition a google service account is needed to access the firestore database as
 well as the rubric (the rubric file has to be shared with the service account)
@@ -73,9 +73,8 @@ import datetime
 import pytz
 
 from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-import base64
-from email.mime.text import MIMEText
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Email, To, Content
 
 #logging configuration
 
@@ -182,6 +181,11 @@ def load_app_config():
     firestore_key_raw = get_required_secret('FIRESTORE_PRIVATE_KEY_KEY_NAME')
     gemini_api_key = get_required_secret('GEMINI_API_KEY_NAME')
 
+    # Get SendGrid API key from Secret Manager
+    sendgrid_api_key = access_secret_payload(project_id, 'sendgrid-api-key')
+    if not sendgrid_api_key:
+        print("Warning: SendGrid API key not found. Email notifications will be disabled.", file=sys.stderr)
+
     # Get OAuth redirect URI from environment (for development with ngrok)
     # If not set, use default based on production flag
     oauth_redirect_uri = os.environ.get('OAUTH_REDIRECT_URI', '')
@@ -246,7 +250,8 @@ def load_app_config():
         "firestore_cred_dict": firestore_cred_dict,
         "client_config": client_config,
         "redirect_uri_index": redirect_uri_index,
-        "gemini_api_key": gemini_api_key
+        "gemini_api_key": gemini_api_key,
+        "sendgrid_api_key": sendgrid_api_key
     }
 
 
@@ -266,31 +271,26 @@ except Exception as e:
 
 
 
-# Initialize Gmail service with service account (requires domain-wide delegation)
-# Get the email address to send from (must be in your Google Workspace domain)
-gmail_sender_email = os.environ.get('GMAIL_SENDER_EMAIL', '')
+# Initialize SendGrid email service
+# Get the email address to send from
+sendgrid_from_email = os.environ.get('SENDGRID_FROM_EMAIL', '')
+sendgrid_api_key = config.get('sendgrid_api_key')
 
-if gmail_sender_email:
+if sendgrid_api_key and sendgrid_from_email:
     try:
-        # Create credentials from the service account with domain-wide delegation
-        GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.send']
-        gmail_creds = service_account.Credentials.from_service_account_info(
-            firestore_cred_dict,
-            scopes=GMAIL_SCOPES,
-            subject=gmail_sender_email  # Impersonate this user
-        )
-
-        # Build Gmail service
-        email_service = build('gmail', 'v1', credentials=gmail_creds)
-        logging.info(f"Gmail service initialized with service account, sending as: {gmail_sender_email}")
+        # Initialize SendGrid client
+        sendgrid_client = SendGridAPIClient(sendgrid_api_key)
+        logging.info(f"SendGrid email service initialized, sending as: {sendgrid_from_email}")
     except Exception as e:
-        logging.error(f"Failed to initialize Gmail service with service account: {e}")
-        logging.error("Make sure domain-wide delegation is enabled for the service account.")
-        email_service = None
+        logging.error(f"Failed to initialize SendGrid service: {e}")
+        sendgrid_client = None
 else:
-    logging.warning("GMAIL_SENDER_EMAIL not configured. Email notifications will not work.")
-    logging.warning("Set GMAIL_SENDER_EMAIL environment variable to enable email notifications.")
-    email_service = None
+    if not sendgrid_api_key:
+        logging.warning("SendGrid API key not found in Secret Manager (sendgrid-api-key). Email notifications will not work.")
+    if not sendgrid_from_email:
+        logging.warning("SENDGRID_FROM_EMAIL not configured. Email notifications will not work.")
+        logging.warning("Set SENDGRID_FROM_EMAIL environment variable to enable email notifications.")
+    sendgrid_client = None
 
 
 client_config = config["client_config"]
@@ -1311,27 +1311,26 @@ async def fetch_grader_response_api(
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
 # Send email
-def send_email(email_service, to, subject, body):
+def send_email(sendgrid_client, from_email, to, subject, body):
     """
-    Send an email using Gmail API.
+    Send an email using SendGrid API.
     Returns True if successful, False otherwise.
     """
-    if email_service is None:
-        logging.error("Email service not initialized. Cannot send email.")
-        logging.error("Please configure GMAIL_SENDER_EMAIL and set up domain-wide delegation.")
+    if sendgrid_client is None:
+        logging.error("SendGrid client not initialized. Cannot send email.")
+        logging.error("Please configure SENDGRID_FROM_EMAIL and ensure sendgrid-api-key is in Secret Manager.")
         return False
 
-    message = MIMEText(body)
-    message['to'] = to
-    message['subject'] = subject
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-
     try:
-        sent = email_service.users().messages().send(
-            userId='me',
-            body={'raw': raw}
-        ).execute()
-        logging.info(f"Email sent to {to}! Message ID: {sent['id']}")
+        message = Mail(
+            from_email=Email(from_email),
+            to_emails=To(to),
+            subject=subject,
+            plain_text_content=Content("text/plain", body)
+        )
+
+        response = sendgrid_client.send(message)
+        logging.info(f"Email sent to {to}! Status code: {response.status_code}")
         return True
     except Exception as e:
         logging.error(f"Failed to send email to {to}: {e}")
@@ -1374,7 +1373,7 @@ async def notify_student_grades_api(
 
         logging.info(f"Instructor {current_user.get('email')} is sending email to {user_email} with subject '{subject}'")
 
-        email_sent = send_email(email_service, user_email, subject, msg_body)
+        email_sent = send_email(sendgrid_client, sendgrid_from_email, user_email, subject, msg_body)
 
         if email_sent:
             return NotifyGradedResponse(

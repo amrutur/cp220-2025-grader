@@ -11,9 +11,12 @@ marks. The rubric file has to be shared with a service account
 
 It logs the interactions in a Firsestore NoSQl database
 
-Two environment parameters are requred:
+Required environment parameters:
 GOOGLE_CLOUD_PROECT (should be set to be the project id for the application google cloud)
 PRODUCTION (should be set to 0 for local testing and 1 for production)
+INSTRUCTOR_EMAILS (comma-separated list of authorized instructor email addresses)
+OAUTH_REDIRECT_URI (optional, for development with ngrok - e.g., https://yoursubdomain.ngrok-free.app/callback)
+SENDGRID_FROM_EMAIL (email address to send emails from)
 
 In addition a google service account is needed to access the firestore database as
 well as the rubric (the rubric file has to be shared with the service account)
@@ -51,6 +54,7 @@ from google.adk.agents import Agent
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -69,9 +73,8 @@ import datetime
 import pytz
 
 from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-import base64
-from email.mime.text import MIMEText
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Email, To, Content
 
 #logging configuration
 
@@ -113,6 +116,16 @@ root_logger.setLevel(logging.DEBUG)
 ASSIST_API_DISABLE_START = datetime.datetime(2025, 10, 6,12,00,00)
 ASSIST_API_DISABLE_END = datetime.datetime(2025, 10, 6,17,0,00)
 
+# List of authorized instructor emails loaded from environment variable
+# Set INSTRUCTOR_EMAILS environment variable with comma-separated email addresses
+# Example: INSTRUCTOR_EMAILS="instructor1@example.com,instructor2@example.com"
+instructor_emails_env = os.environ.get('INSTRUCTOR_EMAILS', '')
+INSTRUCTOR_EMAILS = [email.strip() for email in instructor_emails_env.split(',') if email.strip()]
+
+# Log warning if no instructor emails are configured
+if not INSTRUCTOR_EMAILS:
+    logging.warning("No instructor emails configured. Set INSTRUCTOR_EMAILS environment variable with comma-separated email addresses.")
+
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
     """
@@ -138,7 +151,7 @@ def access_secret_payload(project_id: str, secret_id: str, version_id: str = "la
 
 def load_app_config():
     """Loads all configuration from environment variables and Secret Manager, then initializes services."""
-    load_dotenv()
+    load_dotenv(interpolate=True)
 
     # --- Helper functions for loading ---
     def get_required_env(var_name):
@@ -168,10 +181,21 @@ def load_app_config():
     firestore_key_raw = get_required_secret('FIRESTORE_PRIVATE_KEY_KEY_NAME')
     gemini_api_key = get_required_secret('GEMINI_API_KEY_NAME')
 
+    # Get SendGrid API key from Secret Manager
+    sendgrid_api_key = access_secret_payload(project_id, 'sendgrid-api-key')
+    if not sendgrid_api_key:
+        print("Warning: SendGrid API key not found. Email notifications will be disabled.", file=sys.stderr)
+
+    # Get OAuth redirect URI from environment (for development with ngrok)
+    # If not set, use default based on production flag
+    oauth_redirect_uri = os.environ.get('OAUTH_REDIRECT_URI', '')
+
     # --- Configure services ---
     if not is_production:
         os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
         print("Running in development mode. Insecure OAUTH callback enabled.")
+        if oauth_redirect_uri:
+            print(f"Using custom OAuth redirect URI: {oauth_redirect_uri}")
 
     # --- Construct configuration dictionaries ---
     firestore_key = firestore_key_raw.replace('\\n', '\n')
@@ -189,6 +213,16 @@ def load_app_config():
         "universe_domain": "googleapis.com"
     }
 
+    # Build redirect URIs list
+    default_redirect_uris = [
+        "http://localhost:8080/callback",
+        "https://cp220-grader-api-622756405105.asia-south1.run.app/callback",
+    ]
+
+    # Add custom redirect URI from environment if provided (e.g., ngrok URL)
+    if oauth_redirect_uri:
+        default_redirect_uris.append(oauth_redirect_uri)
+
     client_config = {
         "web": {
             "client_id": oauth_client_id,
@@ -197,16 +231,23 @@ def load_app_config():
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_secret": oauth_client_secret,
-            "redirect_uris": [
-                "http://localhost:8080/callback",
-                "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
-                "https://b5ee73f0d420.ngrok-free.app/callback"
-            ],
+            "redirect_uris": default_redirect_uris,
         }
     }
 
-    # Determine the correct redirect URI based on production status
-    redirect_uri_index = 1 if is_production else 2
+    # Determine the correct redirect URI based on production status and environment
+    if is_production:
+        redirect_uri_index = 1  # Use Cloud Run URL
+    elif oauth_redirect_uri:
+        redirect_uri_index = 2  # Use custom redirect URI (e.g., ngrok)
+    else:
+        redirect_uri_index = 0  # Use localhost
+
+    selected_redirect_uri = default_redirect_uris[redirect_uri_index]
+    print(f"OAuth Configuration:")
+    print(f"  Production mode: {is_production}")
+    print(f"  Selected redirect URI: {selected_redirect_uri}")
+    print(f"  Available redirect URIs: {default_redirect_uris}")
 
     return {
         "project_id": project_id,
@@ -215,7 +256,9 @@ def load_app_config():
         "firestore_cred_dict": firestore_cred_dict,
         "client_config": client_config,
         "redirect_uri_index": redirect_uri_index,
-        "gemini_api_key": gemini_api_key
+        "gemini_api_key": gemini_api_key,
+        "sendgrid_api_key": sendgrid_api_key,
+        "is_production": is_production
     }
 
 
@@ -235,13 +278,26 @@ except Exception as e:
 
 
 
-# Authenticate
-GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.send']
-gmail_flow = InstalledAppFlow.from_client_secrets_file('credentials.json', GMAIL_SCOPES)
-gmail_creds = gmail_flow.run_local_server(port=0)
+# Initialize SendGrid email service
+# Get the email address to send from
+sendgrid_from_email = os.environ.get('SENDGRID_FROM_EMAIL', '')
+sendgrid_api_key = config.get('sendgrid_api_key')
 
-# Build Gmail service
-email_service = build('gmail', 'v1', credentials=gmail_creds)
+if sendgrid_api_key and sendgrid_from_email:
+    try:
+        # Initialize SendGrid client
+        sendgrid_client = SendGridAPIClient(sendgrid_api_key)
+        logging.info(f"SendGrid email service initialized, sending as: {sendgrid_from_email}")
+    except Exception as e:
+        logging.error(f"Failed to initialize SendGrid service: {e}")
+        sendgrid_client = None
+else:
+    if not sendgrid_api_key:
+        logging.warning("SendGrid API key not found in Secret Manager (sendgrid-api-key). Email notifications will not work.")
+    if not sendgrid_from_email:
+        logging.warning("SENDGRID_FROM_EMAIL not configured. Email notifications will not work.")
+        logging.warning("Set SENDGRID_FROM_EMAIL environment variable to enable email notifications.")
+    sendgrid_client = None
 
 
 client_config = config["client_config"]
@@ -282,6 +338,36 @@ def credentials_to_dict(credentials):
             'client_id': credentials.client_id,
             'client_secret': credentials.client_secret,
             'scopes': credentials.scopes}
+
+def get_current_user(request: Request) -> Dict[str, Any]:
+    """
+    Dependency to get the current authenticated user from session.
+    Raises 401 if user is not logged in.
+    """
+    if 'user' not in request.session:
+        raise HTTPException(
+            status_code=401,
+            detail="User not authenticated. Please login first at /login"
+        )
+    return request.session['user']
+
+def get_instructor_user(request: Request) -> Dict[str, Any]:
+    """
+    Dependency to verify the current user is an instructor.
+    Add instructor email addresses to the INSTRUCTOR_EMAILS list at the top of this file.
+    """
+    user = get_current_user(request)
+
+    user_email = user.get('email', '').lower()
+
+    # Check if user email is in the instructor list
+    if user_email not in [email.lower() for email in INSTRUCTOR_EMAILS]:
+        raise HTTPException(
+            status_code=403,
+            detail="Access forbidden. This endpoint is only available to instructors."
+        )
+
+    return user
 
 # --- OAuth2 Configuration ---
 # The redirect URI must match exactly what you have in the Google Cloud Console.
@@ -438,12 +524,30 @@ origins = [
 #)
 
 
-# Add the session middleware
+# Add the session middleware with proper cookie settings for OAuth flow
 # The secret_key is used to sign the session cookie for security.
+is_production = config["is_production"]
+
+# Determine if we're using HTTPS (production or ngrok)
+using_https = is_production or os.environ.get('OAUTH_REDIRECT_URI', '').startswith('https://')
+
+# Configure session middleware with settings optimized for Cloud Run
 app.add_middleware(
     SessionMiddleware,
-    secret_key=signing_secret_key # Use an environment variable for this in production!
+    secret_key=signing_secret_key,
+    session_cookie="session",
+    max_age=3600,  # 1 hour
+    same_site="lax" if is_production else "lax",  # "lax" works for OAuth redirects in production
+    https_only=using_https,  # True for production/ngrok (HTTPS), False for localhost (HTTP)
+    path="/"  # Ensure cookie is valid for all paths
 )
+
+if is_production:
+    logging.info("Session cookies configured for Cloud Run production (HTTPS, same_site=lax)")
+elif using_https:
+    logging.info("Session cookies configured for HTTPS development (ngrok)")
+else:
+    logging.info("Session cookies configured for HTTP development (localhost)")
 
 
 @app.get("/login", tags=["Authentication"])
@@ -452,8 +556,10 @@ async def login(request: Request):
     """
     Redirects the user to the Google OAuth consent screen to initiate login.
     """
-    print("Request Headers:", request.headers)
-    print("Client Host:", request.client.host)    
+    logging.info(f"Login request received from: {request.client.host if request.client else 'unknown'}")
+    logging.info(f"Login request URL: {request.url}")
+    logging.debug(f"Login request headers: {dict(request.headers)}")
+    logging.debug(f"Login existing cookies: {request.cookies}")
 
     flow = Flow.from_client_config(
         client_config=client_config,
@@ -468,8 +574,27 @@ async def login(request: Request):
 
     # Store the state in the user's session to verify it in the callback, preventing CSRF.
     request.session['state'] = state
+    logging.info(f"Login: Generated and stored state in session: {state[:10]}...")
+    logging.info(f"Login: Using redirect URI: {client_config['web']['redirect_uris'][REDIRECT_URI_INDEX]}")
+    logging.debug(f"Login: Session data after storing state: {dict(request.session)}")
 
-    return RedirectResponse(authorization_url)
+    # Use HTML redirect to ensure session cookie is set before redirect
+    # Direct RedirectResponse can sometimes redirect before session middleware sets the cookie
+    html_content = f"""
+    <html>
+        <head>
+            <title>Redirecting to Google...</title>
+            <meta http-equiv="refresh" content="0;url={authorization_url}">
+        </head>
+        <body>
+            <p>Redirecting to Google for authentication...</p>
+            <p>If you are not redirected automatically, <a href="{authorization_url}">click here</a>.</p>
+        </body>
+    </html>
+    """
+
+    logging.info(f"Login: Redirecting to Google OAuth via HTML redirect: {authorization_url[:80]}...")
+    return HTMLResponse(content=html_content, status_code=200)
 
 @app.get("/callback", tags=["Authentication"])
 #async def oauth_callback(request: Request,client_config:dict = Depends(get_client_config)):
@@ -478,17 +603,60 @@ async def oauth_callback(request: Request):
     Handles the callback from Google after user consent.
     Exchanges the authorization code for credentials and creates a user session.
     """
+    logging.info(f"Callback request received from: {request.client.host if request.client else 'unknown'}")
+    logging.info(f"Callback request URL: {request.url}")
+    logging.debug(f"Callback request headers: {dict(request.headers)}")
+    logging.info(f"Callback cookies received: {list(request.cookies.keys())}")
+
     state = request.session.get('state')
-    if not state or state != request.query_params.get('state'):
+    query_state = request.query_params.get('state')
+
+    logging.info(f"Callback: Session state: {state[:10] if state else 'None'}...")
+    logging.info(f"Callback: Query state: {query_state[:10] if query_state else 'None'}...")
+    logging.debug(f"Callback: Full session data: {dict(request.session)}")
+    logging.debug(f"Callback: Full cookies: {request.cookies}")
+
+    if not state:
+        logging.error("Callback: No state found in session. Session may not be persisting.")
+        logging.error(f"Callback: Available session keys: {list(request.session.keys())}")
+        logging.error(f"Callback: Cookies present: {list(request.cookies.keys())}")
+        raise HTTPException(
+            status_code=400,
+            detail="No state found in session. Session cookies may not be working. Please try logging in again."
+        )
+
+    if state != query_state:
+        logging.error(f"Callback: State mismatch. Session: {state}, Query: {query_state}")
         raise HTTPException(status_code=400, detail="State mismatch, possible CSRF attack.")
 
 
     flow = Flow.from_client_config(
-        client_config=client_config, 
-        scopes=SCOPES, 
+        client_config=client_config,
+        scopes=SCOPES,
         redirect_uri=client_config['web']['redirect_uris'][REDIRECT_URI_INDEX]
         )
-    flow.fetch_token(authorization_response=str(request.url))
+
+    # Reconstruct the authorization response URL with HTTPS
+    # Cloud Run terminates HTTPS at the load balancer, so request.url shows HTTP
+    # But OAuth requires HTTPS, so we need to reconstruct with the correct protocol
+    authorization_response = str(request.url)
+
+    # Check if running behind a proxy (Cloud Run) and fix the protocol
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
+    if forwarded_proto == 'https' and authorization_response.startswith('http://'):
+        authorization_response = authorization_response.replace('http://', 'https://', 1)
+        logging.info(f"Callback: Corrected authorization_response from HTTP to HTTPS (X-Forwarded-Proto: https)")
+
+    logging.info(f"Callback: Using authorization_response: {authorization_response[:100]}...")
+
+    # Fetch token - handle scope mismatch warnings gracefully
+    # Google may not grant all requested scopes (e.g., drive.readonly requires additional consent screen setup)
+    try:
+        flow.fetch_token(authorization_response=authorization_response)
+    except Warning as w:
+        # Log the warning but continue - OAuth succeeded even if not all scopes were granted
+        logging.warning(f"OAuth scope warning (non-fatal): {w}")
+        # The flow.credentials are still valid even with the warning
 
     flow_creds = flow.credentials
     # Store credentials and user info in the session.
@@ -1130,10 +1298,37 @@ async def root():
             <form action="/login" method="get">
                 <button type="submit" style="padding: 10px 20px; font-size: 16px; cursor: pointer;">Login with Google</button>
             </form>
+            <br><br>
+            <p style="font-size: 12px; color: #666;">
+                Having login issues? Check <a href="/session-test">session test</a>
+            </p>
         </body>
     </html>
     """
     return HTMLResponse(content=html_content, status_code=200)
+
+@app.get("/session-test")
+async def session_test(request: Request):
+    """
+    Diagnostic endpoint to test if sessions are working properly.
+    Useful for debugging OAuth state mismatch issues.
+    """
+    # Try to get an existing test value
+    test_value = request.session.get('test_value', None)
+
+    # Set a new test value
+    import time
+    new_value = f"test_{int(time.time())}"
+    request.session['test_value'] = new_value
+
+    return {
+        "message": "Session test endpoint",
+        "previous_test_value": test_value,
+        "new_test_value": new_value,
+        "session_keys": list(request.session.keys()),
+        "cookies_received": list(request.cookies.keys()),
+        "instructions": "Refresh this page. If 'previous_test_value' matches the previous 'new_test_value', sessions are working."
+    }
 
 def fetch_grader_response(db, notebook_id:str=None, user_email:str=None):
     '''
@@ -1179,8 +1374,13 @@ def fetch_grader_response(db, notebook_id:str=None, user_email:str=None):
         #traceback.print_exc()
 
 @app.post("/fetch_grader_response", response_model=FetchGradedResponse)
-async def fetch_grader_response_api(query_body: FetchGradedRequest, request: Request):
-    '''Fetch the graded response for a student from the database'''
+async def fetch_grader_response_api(
+    query_body: FetchGradedRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    '''Fetch the graded response for a student from the database.
+    Students can only fetch their own grades. Instructors can fetch any student's grades.'''
     try:
 
         if not query_body.notebook_id:
@@ -1190,6 +1390,17 @@ async def fetch_grader_response_api(query_body: FetchGradedRequest, request: Req
             raise HTTPException(status_code=400, detail="user_email not provided")
 
         user_email = query_body.user_email
+        authenticated_email = current_user.get('email', '').lower()
+
+        # Check if the authenticated user is an instructor
+        is_instructor = authenticated_email in [email.lower() for email in INSTRUCTOR_EMAILS]
+
+        # Check authorization: user must be fetching their own grades OR be an instructor
+        if not is_instructor and authenticated_email != user_email.lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Access forbidden. You can only fetch your own grades."
+            )
 
         logging.debug(f"Fetching grader response for email: {user_email} and notebook_id: {query_body.notebook_id}")
         grader_response = fetch_grader_response(db, notebook_id=query_body.notebook_id, user_email=user_email)
@@ -1208,27 +1419,40 @@ async def fetch_grader_response_api(query_body: FetchGradedRequest, request: Req
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
 # Send email
-def send_email(email_service, to, subject, body):
-    message = MIMEText(body)
-    message['to'] = to
-    message['subject'] = subject
-    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    
+def send_email(sendgrid_client, from_email, to, subject, body):
+    """
+    Send an email using SendGrid API.
+    Returns True if successful, False otherwise.
+    """
+    if sendgrid_client is None:
+        logging.error("SendGrid client not initialized. Cannot send email.")
+        logging.error("Please configure SENDGRID_FROM_EMAIL and ensure sendgrid-api-key is in Secret Manager.")
+        return False
+
     try:
-        sent = email_service.users().messages().send(
-            userId='me',
-            body={'raw': raw}
-        ).execute()
-        print(f"Email sent! Message ID: {sent['id']}")
-        return sent
+        message = Mail(
+            from_email=Email(from_email),
+            to_emails=To(to),
+            subject=subject,
+            plain_text_content=Content("text/plain", body)
+        )
+
+        response = sendgrid_client.send(message)
+        logging.info(f"Email sent to {to}! Status code: {response.status_code}")
+        return True
     except Exception as e:
-        print(f"Error: {e}")
-        return None
+        logging.error(f"Failed to send email to {to}: {e}")
+        return False
 
 
 @app.post("/notify_student_grades", response_model=NotifyGradedResponse)
-async def notify_student_grades_api(query_body: NotifyGradedRequest, request: Request):
-    '''Fetch the graded response for a student from the database'''
+async def notify_student_grades_api(
+    query_body: NotifyGradedRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
+    '''Fetch the graded response for a student from the database and send email notification.
+    This endpoint is only accessible to instructors.'''
     try:
 
 
@@ -1254,14 +1478,20 @@ async def notify_student_grades_api(query_body: NotifyGradedRequest, request: Re
         msg_body += json.dumps(grader_response, indent=4)
 
         msg_body+="\n\nBest regards,\nCP220-2025 Grading Assistant"
-        
-        logging.debug(f"Sending email to {user_email} with subject '{subject}' and body:\n{msg_body}")
-        
-        send_email(email_service, user_email, subject, msg_body)
-    
-        return NotifyGradedResponse(
-            response=f"Sent email to {user_email} with graded response."
-        )
+
+        logging.info(f"Instructor {current_user.get('email')} is sending email to {user_email} with subject '{subject}'")
+
+        email_sent = send_email(sendgrid_client, sendgrid_from_email, user_email, subject, msg_body)
+
+        if email_sent:
+            return NotifyGradedResponse(
+                response=f"Successfully sent email to {user_email} with graded response."
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send email. Please check server logs and ensure email service is properly configured."
+            )
 
     except Exception as e:
         # By logging the exception with its traceback, you can see the root cause in your server logs.
@@ -1282,12 +1512,19 @@ async def profile(request: Request):
     
 
 @app.post("/fetch_student_list", response_model=FetchStudentListResponse)
-async def fetch_student_list_api(query_body: FetchStudentListRequest, request: Request):
+async def fetch_student_list_api(
+    query_body: FetchStudentListRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
     '''
-    Fetch the lst of  students from the database
-    returns a dictionary of user_id to name and email  
+    Fetch the list of students from the database.
+    Returns a dictionary of user_id to name and email.
+    This endpoint is only accessible to instructors.
     '''
     try:
+
+        logging.info(f"Instructor {current_user.get('email')} is fetching student list")
 
         user_list = get_user_list(db)
         student_list = {}

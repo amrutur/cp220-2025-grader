@@ -154,8 +154,9 @@ gcloud run deploy $SERVICE_NAME \
 
 After deployment, Cloud Run will give you a URL like:
 ```
-https://cp220-grader-api-zuqb5siaua-el.a.run.app
+https://cp220-grader-api-622756405105.asia-south1.run.app
 ```
+(Or check with: `gcloud run services describe cp220-grader-api --region asia-south1 --format 'value(status.url)'`)
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Navigate to **APIs & Services** > **Credentials**

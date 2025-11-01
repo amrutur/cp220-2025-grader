@@ -216,7 +216,7 @@ def load_app_config():
     # Build redirect URIs list
     default_redirect_uris = [
         "http://localhost:8080/callback",
-        "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
+        "https://cp220-grader-api-622756405105.asia-south1.run.app/callback",
     ]
 
     # Add custom redirect URI from environment if provided (e.g., ngrok URL)

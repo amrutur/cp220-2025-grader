@@ -11,9 +11,10 @@ marks. The rubric file has to be shared with a service account
 
 It logs the interactions in a Firsestore NoSQl database
 
-Two environment parameters are requred:
+Required environment parameters:
 GOOGLE_CLOUD_PROECT (should be set to be the project id for the application google cloud)
 PRODUCTION (should be set to 0 for local testing and 1 for production)
+INSTRUCTOR_EMAILS (comma-separated list of authorized instructor email addresses)
 
 In addition a google service account is needed to access the firestore database as
 well as the rubric (the rubric file has to be shared with the service account)
@@ -113,12 +114,15 @@ root_logger.setLevel(logging.DEBUG)
 ASSIST_API_DISABLE_START = datetime.datetime(2025, 10, 6,12,00,00)
 ASSIST_API_DISABLE_END = datetime.datetime(2025, 10, 6,17,0,00)
 
-# List of authorized instructor emails
-# TODO: Move this to environment variables or database
-INSTRUCTOR_EMAILS = [
-    "instructor@example.com",  # Replace with actual instructor emails
-    # Add more instructor emails here
-]
+# List of authorized instructor emails loaded from environment variable
+# Set INSTRUCTOR_EMAILS environment variable with comma-separated email addresses
+# Example: INSTRUCTOR_EMAILS="instructor1@example.com,instructor2@example.com"
+instructor_emails_env = os.environ.get('INSTRUCTOR_EMAILS', '')
+INSTRUCTOR_EMAILS = [email.strip() for email in instructor_emails_env.split(',') if email.strip()]
+
+# Log warning if no instructor emails are configured
+if not INSTRUCTOR_EMAILS:
+    logging.warning("No instructor emails configured. Set INSTRUCTOR_EMAILS environment variable with comma-separated email addresses.")
 
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:

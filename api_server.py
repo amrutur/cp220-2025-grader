@@ -525,19 +525,23 @@ is_production = config["is_production"]
 # Determine if we're using HTTPS (production or ngrok)
 using_https = is_production or os.environ.get('OAUTH_REDIRECT_URI', '').startswith('https://')
 
+# Configure session middleware with settings optimized for Cloud Run
 app.add_middleware(
     SessionMiddleware,
     secret_key=signing_secret_key,
     session_cookie="session",
     max_age=3600,  # 1 hour
-    same_site="lax",  # Allow cookies in OAuth redirect flow
-    https_only=using_https  # True for production/ngrok (HTTPS), False for localhost (HTTP)
+    same_site="lax" if is_production else "lax",  # "lax" works for OAuth redirects in production
+    https_only=using_https,  # True for production/ngrok (HTTPS), False for localhost (HTTP)
+    path="/"  # Ensure cookie is valid for all paths
 )
 
-if using_https:
-    logging.info("Session cookies configured for HTTPS (secure mode)")
+if is_production:
+    logging.info("Session cookies configured for Cloud Run production (HTTPS, same_site=lax)")
+elif using_https:
+    logging.info("Session cookies configured for HTTPS development (ngrok)")
 else:
-    logging.info("Session cookies configured for HTTP (development mode)")
+    logging.info("Session cookies configured for HTTP development (localhost)")
 
 
 @app.get("/login", tags=["Authentication"])
@@ -546,8 +550,10 @@ async def login(request: Request):
     """
     Redirects the user to the Google OAuth consent screen to initiate login.
     """
-    print("Request Headers:", request.headers)
-    print("Client Host:", request.client.host)    
+    logging.info(f"Login request received from: {request.client.host if request.client else 'unknown'}")
+    logging.info(f"Login request URL: {request.url}")
+    logging.debug(f"Login request headers: {dict(request.headers)}")
+    logging.debug(f"Login existing cookies: {request.cookies}")
 
     flow = Flow.from_client_config(
         client_config=client_config,
@@ -563,9 +569,12 @@ async def login(request: Request):
     # Store the state in the user's session to verify it in the callback, preventing CSRF.
     request.session['state'] = state
     logging.info(f"Login: Generated and stored state in session: {state[:10]}...")
-    logging.debug(f"Login: Session data: {dict(request.session)}")
+    logging.info(f"Login: Using redirect URI: {client_config['web']['redirect_uris'][REDIRECT_URI_INDEX]}")
+    logging.debug(f"Login: Session data after storing state: {dict(request.session)}")
 
-    return RedirectResponse(authorization_url)
+    response = RedirectResponse(authorization_url)
+    logging.info(f"Login: Redirecting to Google OAuth: {authorization_url[:80]}...")
+    return response
 
 @app.get("/callback", tags=["Authentication"])
 #async def oauth_callback(request: Request,client_config:dict = Depends(get_client_config)):
@@ -574,17 +583,27 @@ async def oauth_callback(request: Request):
     Handles the callback from Google after user consent.
     Exchanges the authorization code for credentials and creates a user session.
     """
+    logging.info(f"Callback request received from: {request.client.host if request.client else 'unknown'}")
+    logging.info(f"Callback request URL: {request.url}")
+    logging.debug(f"Callback request headers: {dict(request.headers)}")
+    logging.info(f"Callback cookies received: {list(request.cookies.keys())}")
+
     state = request.session.get('state')
     query_state = request.query_params.get('state')
 
     logging.info(f"Callback: Session state: {state[:10] if state else 'None'}...")
     logging.info(f"Callback: Query state: {query_state[:10] if query_state else 'None'}...")
-    logging.debug(f"Callback: Session data: {dict(request.session)}")
-    logging.debug(f"Callback: Cookies: {request.cookies}")
+    logging.debug(f"Callback: Full session data: {dict(request.session)}")
+    logging.debug(f"Callback: Full cookies: {request.cookies}")
 
     if not state:
         logging.error("Callback: No state found in session. Session may not be persisting.")
-        raise HTTPException(status_code=400, detail="No state found in session. Please try logging in again.")
+        logging.error(f"Callback: Available session keys: {list(request.session.keys())}")
+        logging.error(f"Callback: Cookies present: {list(request.cookies.keys())}")
+        raise HTTPException(
+            status_code=400,
+            detail="No state found in session. Session cookies may not be working. Please try logging in again."
+        )
 
     if state != query_state:
         logging.error(f"Callback: State mismatch. Session: {state}, Query: {query_state}")
@@ -1246,10 +1265,37 @@ async def root():
             <form action="/login" method="get">
                 <button type="submit" style="padding: 10px 20px; font-size: 16px; cursor: pointer;">Login with Google</button>
             </form>
+            <br><br>
+            <p style="font-size: 12px; color: #666;">
+                Having login issues? Check <a href="/session-test">session test</a>
+            </p>
         </body>
     </html>
     """
     return HTMLResponse(content=html_content, status_code=200)
+
+@app.get("/session-test")
+async def session_test(request: Request):
+    """
+    Diagnostic endpoint to test if sessions are working properly.
+    Useful for debugging OAuth state mismatch issues.
+    """
+    # Try to get an existing test value
+    test_value = request.session.get('test_value', None)
+
+    # Set a new test value
+    import time
+    new_value = f"test_{int(time.time())}"
+    request.session['test_value'] = new_value
+
+    return {
+        "message": "Session test endpoint",
+        "previous_test_value": test_value,
+        "new_test_value": new_value,
+        "session_keys": list(request.session.keys()),
+        "cookies_received": list(request.cookies.keys()),
+        "instructions": "Refresh this page. If 'previous_test_value' matches the previous 'new_test_value', sessions are working."
+    }
 
 def fetch_grader_response(db, notebook_id:str=None, user_email:str=None):
     '''

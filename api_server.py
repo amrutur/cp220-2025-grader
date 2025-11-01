@@ -636,10 +636,23 @@ async def oauth_callback(request: Request):
         redirect_uri=client_config['web']['redirect_uris'][REDIRECT_URI_INDEX]
         )
 
+    # Reconstruct the authorization response URL with HTTPS
+    # Cloud Run terminates HTTPS at the load balancer, so request.url shows HTTP
+    # But OAuth requires HTTPS, so we need to reconstruct with the correct protocol
+    authorization_response = str(request.url)
+
+    # Check if running behind a proxy (Cloud Run) and fix the protocol
+    forwarded_proto = request.headers.get('X-Forwarded-Proto', '')
+    if forwarded_proto == 'https' and authorization_response.startswith('http://'):
+        authorization_response = authorization_response.replace('http://', 'https://', 1)
+        logging.info(f"Callback: Corrected authorization_response from HTTP to HTTPS (X-Forwarded-Proto: https)")
+
+    logging.info(f"Callback: Using authorization_response: {authorization_response[:100]}...")
+
     # Fetch token - handle scope mismatch warnings gracefully
     # Google may not grant all requested scopes (e.g., drive.readonly requires additional consent screen setup)
     try:
-        flow.fetch_token(authorization_response=str(request.url))
+        flow.fetch_token(authorization_response=authorization_response)
     except Warning as w:
         # Log the warning but continue - OAuth succeeded even if not all scopes were granted
         logging.warning(f"OAuth scope warning (non-fatal): {w}")

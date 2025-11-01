@@ -15,6 +15,7 @@ Required environment parameters:
 GOOGLE_CLOUD_PROECT (should be set to be the project id for the application google cloud)
 PRODUCTION (should be set to 0 for local testing and 1 for production)
 INSTRUCTOR_EMAILS (comma-separated list of authorized instructor email addresses)
+OAUTH_REDIRECT_URI (optional, for development with ngrok - e.g., https://yoursubdomain.ngrok-free.app/callback)
 
 In addition a google service account is needed to access the firestore database as
 well as the rubric (the rubric file has to be shared with the service account)
@@ -179,10 +180,16 @@ def load_app_config():
     firestore_key_raw = get_required_secret('FIRESTORE_PRIVATE_KEY_KEY_NAME')
     gemini_api_key = get_required_secret('GEMINI_API_KEY_NAME')
 
+    # Get OAuth redirect URI from environment (for development with ngrok)
+    # If not set, use default based on production flag
+    oauth_redirect_uri = os.environ.get('OAUTH_REDIRECT_URI', '')
+
     # --- Configure services ---
     if not is_production:
         os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
         print("Running in development mode. Insecure OAUTH callback enabled.")
+        if oauth_redirect_uri:
+            print(f"Using custom OAuth redirect URI: {oauth_redirect_uri}")
 
     # --- Construct configuration dictionaries ---
     firestore_key = firestore_key_raw.replace('\\n', '\n')
@@ -200,6 +207,16 @@ def load_app_config():
         "universe_domain": "googleapis.com"
     }
 
+    # Build redirect URIs list
+    default_redirect_uris = [
+        "http://localhost:8080/callback",
+        "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
+    ]
+
+    # Add custom redirect URI from environment if provided (e.g., ngrok URL)
+    if oauth_redirect_uri:
+        default_redirect_uris.append(oauth_redirect_uri)
+
     client_config = {
         "web": {
             "client_id": oauth_client_id,
@@ -208,16 +225,17 @@ def load_app_config():
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_secret": oauth_client_secret,
-            "redirect_uris": [
-                "http://localhost:8080/callback",
-                "https://cp220-grader-api-zuqb5siaua-el.a.run.app/callback",
-                "https://b5ee73f0d420.ngrok-free.app/callback"
-            ],
+            "redirect_uris": default_redirect_uris,
         }
     }
 
-    # Determine the correct redirect URI based on production status
-    redirect_uri_index = 1 if is_production else 2
+    # Determine the correct redirect URI based on production status and environment
+    if is_production:
+        redirect_uri_index = 1  # Use Cloud Run URL
+    elif oauth_redirect_uri:
+        redirect_uri_index = 2  # Use custom redirect URI (e.g., ngrok)
+    else:
+        redirect_uri_index = 0  # Use localhost
 
     return {
         "project_id": project_id,

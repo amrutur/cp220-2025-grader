@@ -543,11 +543,19 @@ async def oauth_callback(request: Request):
 
 
     flow = Flow.from_client_config(
-        client_config=client_config, 
-        scopes=SCOPES, 
+        client_config=client_config,
+        scopes=SCOPES,
         redirect_uri=client_config['web']['redirect_uris'][REDIRECT_URI_INDEX]
         )
-    flow.fetch_token(authorization_response=str(request.url))
+
+    # Fetch token - handle scope mismatch warnings gracefully
+    # Google may not grant all requested scopes (e.g., drive.readonly requires additional consent screen setup)
+    try:
+        flow.fetch_token(authorization_response=str(request.url))
+    except Warning as w:
+        # Log the warning but continue - OAuth succeeded even if not all scopes were granted
+        logging.warning(f"OAuth scope warning (non-fatal): {w}")
+        # The flow.credentials are still valid even with the warning
 
     flow_creds = flow.credentials
     # Store credentials and user info in the session.

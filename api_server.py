@@ -243,6 +243,12 @@ def load_app_config():
     else:
         redirect_uri_index = 0  # Use localhost
 
+    selected_redirect_uri = default_redirect_uris[redirect_uri_index]
+    print(f"OAuth Configuration:")
+    print(f"  Production mode: {is_production}")
+    print(f"  Selected redirect URI: {selected_redirect_uri}")
+    print(f"  Available redirect URIs: {default_redirect_uris}")
+
     return {
         "project_id": project_id,
         "database_id": database_id,

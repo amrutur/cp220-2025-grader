@@ -37,8 +37,21 @@ This guide walks you through deploying the CP220 Grading Assistant API to Google
 Create a file to store your production environment variable values (DO NOT commit this file):
 
 ```bash
-# production.env (DO NOT COMMIT)
+# .env (DO NOT COMMIT)
 INSTRUCTOR_EMAILS=instructor1@example.com,instructor2@example.com
+GOOGLE_CLOUD_PROJECT=your_project_name
+SERVICE_ACCOUNT_EMAIL=email_id@project_id.iam.gserviceaccount.com
+FIRESTORE_CLIENT_ID=<id>
+FIRESTORE_DATABASE_ID=<database_name>
+PRODUCTION=1
+```
+
+Firestore database is used in the backend and so a email service account
+is needed to access this.
+
+Use the following to create a .yaml file for use with gcloud deployment cli
+```bash
+sed 's/=/: "/' .env | sed 's/$/"/' > env.yaml
 ```
 
 ## Step 2: Ensure Secrets are in Secret Manager
@@ -96,7 +109,7 @@ docker push gcr.io/$PROJECT_ID/cp220-grader-api
 # Set variables
 export PROJECT_ID=cp220-grading-assistant
 export SERVICE_NAME=cp220-grader-api
-export REGION=us-east1
+export REGION=asia-south1
 
 # Deploy to Cloud Run
 gcloud run deploy $SERVICE_NAME \
@@ -115,6 +128,22 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars "FIRESTORE_PRIVATE_KEY_ID_KEY_NAME=firestore-key-id" \
   --set-env-vars "FIRESTORE_PRIVATE_KEY_KEY_NAME=firestore-key" \
   --set-env-vars "GEMINI_API_KEY_NAME=gemini-api-key" \
+  --memory 2Gi \
+  --cpu 2 \
+  --timeout 300 \
+  --max-instances 10 \
+  --min-instances 0
+```
+
+or if you have the env.yaml file then use 
+```bash
+gcloud run deploy $SERVICE_NAME \
+  --image gcr.io/$PROJECT_ID/cp220-grader-api \
+  --platform managed \
+  --region $REGION \
+  --allow-unauthenticated \
+  --set-env-vars "PRODUCTION=1" \
+  --env-vars-file env.yaml \
   --memory 2Gi \
   --cpu 2 \
   --timeout 300 \

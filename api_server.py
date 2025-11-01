@@ -251,7 +251,8 @@ def load_app_config():
         "client_config": client_config,
         "redirect_uri_index": redirect_uri_index,
         "gemini_api_key": gemini_api_key,
-        "sendgrid_api_key": sendgrid_api_key
+        "sendgrid_api_key": sendgrid_api_key,
+        "is_production": is_production
     }
 
 
@@ -517,12 +518,26 @@ origins = [
 #)
 
 
-# Add the session middleware
+# Add the session middleware with proper cookie settings for OAuth flow
 # The secret_key is used to sign the session cookie for security.
+is_production = config["is_production"]
+
+# Determine if we're using HTTPS (production or ngrok)
+using_https = is_production or os.environ.get('OAUTH_REDIRECT_URI', '').startswith('https://')
+
 app.add_middleware(
     SessionMiddleware,
-    secret_key=signing_secret_key # Use an environment variable for this in production!
+    secret_key=signing_secret_key,
+    session_cookie="session",
+    max_age=3600,  # 1 hour
+    same_site="lax",  # Allow cookies in OAuth redirect flow
+    https_only=using_https  # True for production/ngrok (HTTPS), False for localhost (HTTP)
 )
+
+if using_https:
+    logging.info("Session cookies configured for HTTPS (secure mode)")
+else:
+    logging.info("Session cookies configured for HTTP (development mode)")
 
 
 @app.get("/login", tags=["Authentication"])
@@ -547,6 +562,8 @@ async def login(request: Request):
 
     # Store the state in the user's session to verify it in the callback, preventing CSRF.
     request.session['state'] = state
+    logging.info(f"Login: Generated and stored state in session: {state[:10]}...")
+    logging.debug(f"Login: Session data: {dict(request.session)}")
 
     return RedirectResponse(authorization_url)
 
@@ -558,7 +575,19 @@ async def oauth_callback(request: Request):
     Exchanges the authorization code for credentials and creates a user session.
     """
     state = request.session.get('state')
-    if not state or state != request.query_params.get('state'):
+    query_state = request.query_params.get('state')
+
+    logging.info(f"Callback: Session state: {state[:10] if state else 'None'}...")
+    logging.info(f"Callback: Query state: {query_state[:10] if query_state else 'None'}...")
+    logging.debug(f"Callback: Session data: {dict(request.session)}")
+    logging.debug(f"Callback: Cookies: {request.cookies}")
+
+    if not state:
+        logging.error("Callback: No state found in session. Session may not be persisting.")
+        raise HTTPException(status_code=400, detail="No state found in session. Please try logging in again.")
+
+    if state != query_state:
+        logging.error(f"Callback: State mismatch. Session: {state}, Query: {query_state}")
         raise HTTPException(status_code=400, detail="State mismatch, possible CSRF attack.")
 
 

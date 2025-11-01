@@ -16,6 +16,7 @@ GOOGLE_CLOUD_PROECT (should be set to be the project id for the application goog
 PRODUCTION (should be set to 0 for local testing and 1 for production)
 INSTRUCTOR_EMAILS (comma-separated list of authorized instructor email addresses)
 OAUTH_REDIRECT_URI (optional, for development with ngrok - e.g., https://yoursubdomain.ngrok-free.app/callback)
+GMAIL_SENDER_EMAIL (email address to send emails from - must be in your Google Workspace domain)
 
 In addition a google service account is needed to access the firestore database as
 well as the rubric (the rubric file has to be shared with the service account)
@@ -53,6 +54,7 @@ from google.adk.agents import Agent
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
+from google.oauth2 import service_account
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -264,13 +266,31 @@ except Exception as e:
 
 
 
-# Authenticate
-GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.send']
-gmail_flow = InstalledAppFlow.from_client_secrets_file('credentials.json', GMAIL_SCOPES)
-gmail_creds = gmail_flow.run_local_server(port=0)
+# Initialize Gmail service with service account (requires domain-wide delegation)
+# Get the email address to send from (must be in your Google Workspace domain)
+gmail_sender_email = os.environ.get('GMAIL_SENDER_EMAIL', '')
 
-# Build Gmail service
-email_service = build('gmail', 'v1', credentials=gmail_creds)
+if gmail_sender_email:
+    try:
+        # Create credentials from the service account with domain-wide delegation
+        GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+        gmail_creds = service_account.Credentials.from_service_account_info(
+            firestore_cred_dict,
+            scopes=GMAIL_SCOPES,
+            subject=gmail_sender_email  # Impersonate this user
+        )
+
+        # Build Gmail service
+        email_service = build('gmail', 'v1', credentials=gmail_creds)
+        logging.info(f"Gmail service initialized with service account, sending as: {gmail_sender_email}")
+    except Exception as e:
+        logging.error(f"Failed to initialize Gmail service with service account: {e}")
+        logging.error("Make sure domain-wide delegation is enabled for the service account.")
+        email_service = None
+else:
+    logging.warning("GMAIL_SENDER_EMAIL not configured. Email notifications will not work.")
+    logging.warning("Set GMAIL_SENDER_EMAIL environment variable to enable email notifications.")
+    email_service = None
 
 
 client_config = config["client_config"]
@@ -1292,21 +1312,30 @@ async def fetch_grader_response_api(
 
 # Send email
 def send_email(email_service, to, subject, body):
+    """
+    Send an email using Gmail API.
+    Returns True if successful, False otherwise.
+    """
+    if email_service is None:
+        logging.error("Email service not initialized. Cannot send email.")
+        logging.error("Please configure GMAIL_SENDER_EMAIL and set up domain-wide delegation.")
+        return False
+
     message = MIMEText(body)
     message['to'] = to
     message['subject'] = subject
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-    
+
     try:
         sent = email_service.users().messages().send(
             userId='me',
             body={'raw': raw}
         ).execute()
-        print(f"Email sent! Message ID: {sent['id']}")
-        return sent
+        logging.info(f"Email sent to {to}! Message ID: {sent['id']}")
+        return True
     except Exception as e:
-        print(f"Error: {e}")
-        return None
+        logging.error(f"Failed to send email to {to}: {e}")
+        return False
 
 
 @app.post("/notify_student_grades", response_model=NotifyGradedResponse)
@@ -1345,11 +1374,17 @@ async def notify_student_grades_api(
 
         logging.info(f"Instructor {current_user.get('email')} is sending email to {user_email} with subject '{subject}'")
 
-        send_email(email_service, user_email, subject, msg_body)
+        email_sent = send_email(email_service, user_email, subject, msg_body)
 
-        return NotifyGradedResponse(
-            response=f"Sent email to {user_email} with graded response."
-        )
+        if email_sent:
+            return NotifyGradedResponse(
+                response=f"Successfully sent email to {user_email} with graded response."
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send email. Please check server logs and ensure email service is properly configured."
+            )
 
     except Exception as e:
         # By logging the exception with its traceback, you can see the root cause in your server logs.

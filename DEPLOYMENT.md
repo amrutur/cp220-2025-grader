@@ -108,6 +108,7 @@ gcloud run deploy $SERVICE_NAME \
   --set-env-vars "PRODUCTION=1" \
   --set-env-vars "FIRESTORE_DATABASE_ID=your-database-id" \
   --set-env-vars "INSTRUCTOR_EMAILS=instructor1@example.com,instructor2@example.com" \
+  --set-env-vars "GMAIL_SENDER_EMAIL=noreply@yourdomain.com" \
   --set-env-vars "OAUTH_CLIENT_ID_KEY_NAME=oauth-client-id" \
   --set-env-vars "OAUTH_CLIENT_SECRET_KEY_NAME=oauth-client-secret" \
   --set-env-vars "SIGNING_SECRET_KEY_NAME=signing-secret" \
@@ -137,7 +138,22 @@ https://cp220-grader-api-zuqb5siaua-el.a.run.app
    ```
 5. Click **Save**
 
-## Step 6: Test Your Deployment
+## Step 6: Configure Gmail API (Optional but Recommended)
+
+To enable email notifications for graded assignments, you need to configure Gmail API with domain-wide delegation.
+
+**Note**: This requires **Google Workspace** (not regular Gmail).
+
+See [GMAIL_SETUP.md](GMAIL_SETUP.md) for complete setup instructions.
+
+Quick summary:
+1. Enable Gmail API in Google Cloud Console
+2. Configure domain-wide delegation in Google Workspace Admin Console
+3. Set `GMAIL_SENDER_EMAIL` environment variable
+
+If you skip this step, the application will work but email notifications won't be sent.
+
+## Step 7: Test Your Deployment
 
 ```bash
 # Get the service URL
@@ -174,6 +190,7 @@ gcloud run deploy $SERVICE_NAME \
 | `PRODUCTION` | Set to 1 for production | `1` |
 | `FIRESTORE_DATABASE_ID` | Firestore database ID | `(default)` |
 | `INSTRUCTOR_EMAILS` | Comma-separated instructor emails | `prof@example.com,ta@example.com` |
+| `GMAIL_SENDER_EMAIL` | Email address to send from (requires Google Workspace + domain-wide delegation) | `noreply@yourdomain.com` |
 | `OAUTH_REDIRECT_URI` | Optional custom redirect URI | Only for dev with ngrok |
 | Secret key environment variables (point to Secret Manager secrets) ||
 | `OAUTH_CLIENT_ID_KEY_NAME` | Name of secret containing OAuth client ID | `oauth-client-id` |

@@ -142,7 +142,6 @@ gcloud run deploy $SERVICE_NAME \
   --platform managed \
   --region $REGION \
   --allow-unauthenticated \
-  --set-env-vars "PRODUCTION=1" \
   --env-vars-file env.yaml \
   --memory 2Gi \
   --cpu 2 \

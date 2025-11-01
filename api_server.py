@@ -113,6 +113,13 @@ root_logger.setLevel(logging.DEBUG)
 ASSIST_API_DISABLE_START = datetime.datetime(2025, 10, 6,12,00,00)
 ASSIST_API_DISABLE_END = datetime.datetime(2025, 10, 6,17,0,00)
 
+# List of authorized instructor emails
+# TODO: Move this to environment variables or database
+INSTRUCTOR_EMAILS = [
+    "instructor@example.com",  # Replace with actual instructor emails
+    # Add more instructor emails here
+]
+
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
     """
@@ -282,6 +289,36 @@ def credentials_to_dict(credentials):
             'client_id': credentials.client_id,
             'client_secret': credentials.client_secret,
             'scopes': credentials.scopes}
+
+def get_current_user(request: Request) -> Dict[str, Any]:
+    """
+    Dependency to get the current authenticated user from session.
+    Raises 401 if user is not logged in.
+    """
+    if 'user' not in request.session:
+        raise HTTPException(
+            status_code=401,
+            detail="User not authenticated. Please login first at /login"
+        )
+    return request.session['user']
+
+def get_instructor_user(request: Request) -> Dict[str, Any]:
+    """
+    Dependency to verify the current user is an instructor.
+    Add instructor email addresses to the INSTRUCTOR_EMAILS list at the top of this file.
+    """
+    user = get_current_user(request)
+
+    user_email = user.get('email', '').lower()
+
+    # Check if user email is in the instructor list
+    if user_email not in [email.lower() for email in INSTRUCTOR_EMAILS]:
+        raise HTTPException(
+            status_code=403,
+            detail="Access forbidden. This endpoint is only available to instructors."
+        )
+
+    return user
 
 # --- OAuth2 Configuration ---
 # The redirect URI must match exactly what you have in the Google Cloud Console.
@@ -1179,8 +1216,13 @@ def fetch_grader_response(db, notebook_id:str=None, user_email:str=None):
         #traceback.print_exc()
 
 @app.post("/fetch_grader_response", response_model=FetchGradedResponse)
-async def fetch_grader_response_api(query_body: FetchGradedRequest, request: Request):
-    '''Fetch the graded response for a student from the database'''
+async def fetch_grader_response_api(
+    query_body: FetchGradedRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    '''Fetch the graded response for a student from the database.
+    Students can only fetch their own grades. Instructors can fetch any student's grades.'''
     try:
 
         if not query_body.notebook_id:
@@ -1190,6 +1232,17 @@ async def fetch_grader_response_api(query_body: FetchGradedRequest, request: Req
             raise HTTPException(status_code=400, detail="user_email not provided")
 
         user_email = query_body.user_email
+        authenticated_email = current_user.get('email', '').lower()
+
+        # Check if the authenticated user is an instructor
+        is_instructor = authenticated_email in [email.lower() for email in INSTRUCTOR_EMAILS]
+
+        # Check authorization: user must be fetching their own grades OR be an instructor
+        if not is_instructor and authenticated_email != user_email.lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Access forbidden. You can only fetch your own grades."
+            )
 
         logging.debug(f"Fetching grader response for email: {user_email} and notebook_id: {query_body.notebook_id}")
         grader_response = fetch_grader_response(db, notebook_id=query_body.notebook_id, user_email=user_email)
@@ -1227,8 +1280,13 @@ def send_email(email_service, to, subject, body):
 
 
 @app.post("/notify_student_grades", response_model=NotifyGradedResponse)
-async def notify_student_grades_api(query_body: NotifyGradedRequest, request: Request):
-    '''Fetch the graded response for a student from the database'''
+async def notify_student_grades_api(
+    query_body: NotifyGradedRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
+    '''Fetch the graded response for a student from the database and send email notification.
+    This endpoint is only accessible to instructors.'''
     try:
 
 
@@ -1254,11 +1312,11 @@ async def notify_student_grades_api(query_body: NotifyGradedRequest, request: Re
         msg_body += json.dumps(grader_response, indent=4)
 
         msg_body+="\n\nBest regards,\nCP220-2025 Grading Assistant"
-        
-        logging.debug(f"Sending email to {user_email} with subject '{subject}' and body:\n{msg_body}")
-        
+
+        logging.info(f"Instructor {current_user.get('email')} is sending email to {user_email} with subject '{subject}'")
+
         send_email(email_service, user_email, subject, msg_body)
-    
+
         return NotifyGradedResponse(
             response=f"Sent email to {user_email} with graded response."
         )
@@ -1282,12 +1340,19 @@ async def profile(request: Request):
     
 
 @app.post("/fetch_student_list", response_model=FetchStudentListResponse)
-async def fetch_student_list_api(query_body: FetchStudentListRequest, request: Request):
+async def fetch_student_list_api(
+    query_body: FetchStudentListRequest,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
     '''
-    Fetch the lst of  students from the database
-    returns a dictionary of user_id to name and email  
+    Fetch the list of students from the database.
+    Returns a dictionary of user_id to name and email.
+    This endpoint is only accessible to instructors.
     '''
     try:
+
+        logging.info(f"Instructor {current_user.get('email')} is fetching student list")
 
         user_list = get_user_list(db)
         student_list = {}

@@ -151,7 +151,7 @@ def access_secret_payload(project_id: str, secret_id: str, version_id: str = "la
 
 def load_app_config():
     """Loads all configuration from environment variables and Secret Manager, then initializes services."""
-    load_dotenv()
+    load_dotenv(interpolate=True)
 
     # --- Helper functions for loading ---
     def get_required_env(var_name):

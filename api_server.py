@@ -1241,7 +1241,7 @@ async def eval_submission(query_body: EvalRequest, request: Request):
         )
         if rubric_content is None:
             raise HTTPException(
-                status_code=404, detail=f"{user_name:user_email} Rubric notebook '{rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
+                status_code=404, detail=f"{user_name} ({user_email}) Rubric notebook '{rubric_link}' not found. Ensure it is shared with the service account: {firestore_cred_dict.get('client_email')}"
             )
         try:
             # .ipynb files are JSON, so we can return them as JSON

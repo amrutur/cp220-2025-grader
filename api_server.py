@@ -500,11 +500,11 @@ def update_marks(db, google_user_id, notebook_id, total_marks, max_marks,graded)
         answer_ref.set({
             u'total_marks': total_marks,
             u'max_marks': max_marks,
-            u'graded_at': firestore.SERVER_TIMESTAMP      
+            u'graded_at': firestore.SERVER_TIMESTAMP
         },merge=True)
-        # Also update the graded details
+        # Also update the graded details (using graded_json for dict/object type)
         answer_ref.set({
-            u'graded': graded
+            u'graded_json': graded
         },merge=True)
     except Exception as e:
         logging.error(f"Error updating marks in Firestore: {e}")
@@ -1355,11 +1355,19 @@ def fetch_grader_response(db, notebook_id:str=None, user_email:str=None):
             logging.debug(f"Fetching graded response for user: {user_name} and notebook_id: {notebook_id}")
             response_json = answer_doc.to_dict()
 
-            logging.debug(f"user:{user_name} : total marks: {response_json.get('total_marks')} Response json: {response_json.get('graded')}")
+            # Try to get graded_json (new format), fall back to graded (old format) for backward compatibility
+            graded_data = response_json.get('graded_json')
+            if graded_data is None:
+                # Backward compatibility: try old 'graded' field (JSON string)
+                graded_string = response_json.get('graded')
+                if graded_string:
+                    graded_data = json.loads(graded_string)
+
+            logging.debug(f"user:{user_name} : total marks: {response_json.get('total_marks')} Response json: {graded_data}")
 
             grader_response = {'user_name':user_name, 'total_marks':response_json.get('total_marks'),'max_marks':response_json.get('max_marks')}
 
-            grader_response['feedback'] = json.loads(response_json.get('graded'))
+            grader_response['feedback'] = graded_data
             logging.debug(f"For  matching user, response is: {grader_response}")
             break
         return grader_response

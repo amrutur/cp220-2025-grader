@@ -907,15 +907,6 @@ async def process_query(query_body: QueryRequest, request: Request):
     if not enable_assist:
         raise HTTPException(status_code=503, detail="Tutor is temporarily disabled")
 
-    #check if the this API is disabled currently
-    now_utc = datetime.datetime.now(pytz.utc)
-    now_ist = now_utc.astimezone(pytz.timezone('Asia/Kolkata'))
-    if ASSIST_API_DISABLE_START.date() <= now_ist.date() and \
-        now_ist.date()  <= ASSIST_API_DISABLE_END.date() and \
-        ASSIST_API_DISABLE_START.time() <= now_ist.time() and \
-        now_ist.time()  <= ASSIST_API_DISABLE_END.time():
-        raise HTTPException(status_code=503, detail="The assist API is temporarily disabled during quiz. Please try again later.")
-
    # print("Processing Query")
     runner = runner_assist
 

@@ -1269,8 +1269,6 @@ async def eval_submission(query_body: EvalRequest, request: Request):
             logging.error("An exception occurred during query processing: %s", e)
             traceback.print_exc()
 
-    except KeyError:
-        raise HTTPException(status_code=401, detail="Invalid session data. Please login again.")
     except Exception as e:
         # By logging the exception with its traceback, you can see the root cause in your server logs.
         logging.error("An exception occurred during query processing: %s", e)

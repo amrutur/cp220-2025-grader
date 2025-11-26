@@ -126,6 +126,10 @@ INSTRUCTOR_EMAILS = [email.strip() for email in instructor_emails_env.split(',')
 if not INSTRUCTOR_EMAILS:
     logging.warning("No instructor emails configured. Set INSTRUCTOR_EMAILS environment variable with comma-separated email addresses.")
 
+# Global state variable to enable/disable the tutor (assist endpoint)
+# Can be controlled via /enable_tutor and /disable_tutor endpoints (instructor only)
+enable_assist = True
+
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
     """
@@ -810,6 +814,10 @@ async def run_agent_and_get_response(current_session_id: str, user_id: str, cont
 @app.post("/assist", response_model=AssistResponse)
 async def assist(query_body: AssistRequest, request: Request):
 
+    # Check if tutor is disabled by instructor
+    if not enable_assist:
+        raise HTTPException(status_code=503, detail="Tutor is temporarily disabled")
+
     #check if the this API is disabled currently
     now_utc = datetime.datetime.now(pytz.utc)
     now_ist = now_utc.astimezone(pytz.timezone('Asia/Kolkata'))
@@ -1491,6 +1499,46 @@ async def notify_student_grades_api(
     except Exception as e:
         # By logging the exception with its traceback, you can see the root cause in your server logs.
         logging.error("An exception occurred during notify_student_grades_api: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
+@app.post("/disable_tutor")
+async def disable_tutor(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
+    '''
+    Disable the tutor (assist endpoint).
+    This endpoint is only accessible to instructors.
+    '''
+    global enable_assist
+    try:
+        enable_assist = False
+        logging.info(f"Instructor {current_user.get('email')} has disabled the tutor")
+        return {"message": "Tutor has been disabled successfully"}
+    except Exception as e:
+        logging.error("An exception occurred during disable_tutor: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
+@app.post("/enable_tutor")
+async def enable_tutor(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
+    '''
+    Enable the tutor (assist endpoint).
+    This endpoint is only accessible to instructors.
+    '''
+    global enable_assist
+    try:
+        enable_assist = True
+        logging.info(f"Instructor {current_user.get('email')} has enabled the tutor")
+        return {"message": "Tutor has been enabled successfully"}
+    except Exception as e:
+        logging.error("An exception occurred during enable_tutor: %s", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 

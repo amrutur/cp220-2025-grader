@@ -1223,11 +1223,6 @@ async def eval_submission(query_body: EvalRequest, request: Request):
             google_user_id = "Unknown"
             logging.warning("Warning: Could not extract google user name and id from notebook metadata.Need to run at least one code cell")
 
-        #Temporary DEBUG
-        if (re.search(r'Amrutur',google_user_name,re.IGNORECASE)):
-            google_user_name = user_name
-            google_user_id = user_email
-    
         logging.info(f"google_user_name={google_user_name}, google_user_id={google_user_id}")
 
         add_user_if_not_exists(db, google_user_id, user_name, user_email, google_user_name)

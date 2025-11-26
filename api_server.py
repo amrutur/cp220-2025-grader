@@ -662,6 +662,14 @@ async def oauth_callback(request: Request):
         # Log the warning but continue - OAuth succeeded even if not all scopes were granted
         logging.warning(f"OAuth scope warning (non-fatal): {w}")
         # The flow.credentials are still valid even with the warning
+    except Exception as e:
+        # Handle actual errors during token exchange
+        logging.error(f"OAuth token exchange failed: {e}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to complete OAuth authentication: {str(e)}"
+        )
 
     flow_creds = flow.credentials
     # Store credentials and user info in the session.

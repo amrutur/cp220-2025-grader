@@ -903,6 +903,9 @@ async def assist(query_body: AssistRequest, request: Request):
 @app.post("/query", response_model=QueryResponse)
 async def process_query(query_body: QueryRequest, request: Request):
 
+    # Check if tutor is disabled by instructor
+    if not enable_assist:
+        raise HTTPException(status_code=503, detail="Tutor is temporarily disabled")
 
     #check if the this API is disabled currently
     now_utc = datetime.datetime.now(pytz.utc)

@@ -502,9 +502,12 @@ def update_marks(db, google_user_id, notebook_id, total_marks, max_marks,graded)
             u'max_marks': max_marks,
             u'graded_at': firestore.SERVER_TIMESTAMP
         },merge=True)
+        # Convert graded dict keys to strings for Firestore compatibility
+        # Firestore requires string keys in maps, but graded has integer keys (question numbers)
+        graded_with_string_keys = {str(k): v for k, v in graded.items()}
         # Also update the graded details (using graded_json for dict/object type)
         answer_ref.set({
-            u'graded_json': graded
+            u'graded_json': graded_with_string_keys
         },merge=True)
     except Exception as e:
         logging.error(f"Error updating marks in Firestore: {e}")

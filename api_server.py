@@ -318,8 +318,9 @@ root_agent = agent.root_agent  # Update this line if your agent module uses a di
 scoring_agent=agent.scoring_agent
 
 # Create a database session service
+# Use aiosqlite for async support (required for Cloud Run deployment)
 session_service = DatabaseSessionService(
-    db_url="sqlite:///agent_sessions.db"
+    db_url="sqlite+aiosqlite:///agent_sessions.db"
 )
 
 # Create a runner with your agents

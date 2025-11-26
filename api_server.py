@@ -1250,8 +1250,7 @@ async def eval_submission(query_body: EvalRequest, request: Request):
             logging.info(f"{google_user_name}: Evaluation completed. Total Marks: {total_marks}/{max_marks} for {num_questions} questions.")
             #print(f"Graded details: {graded}")
 
-            graded_string = json.dumps(graded, indent=2)
-            update_marks(db, google_user_id, query_body.notebook_id, total_marks, max_marks, graded_string)
+            update_marks(db, google_user_id, query_body.notebook_id, total_marks, max_marks, graded)
 
             return EvalResponse(
                 response=google_user_name + ": You have successfully submitted notebook for evaluation. Graded answer will be sent to your email.",

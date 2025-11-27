@@ -128,7 +128,8 @@ if not INSTRUCTOR_EMAILS:
 
 # Global state variable to enable/disable the tutor (assist endpoint)
 # Can be controlled via /enable_tutor and /disable_tutor endpoints (instructor only)
-enable_assist = True
+# Default is False for security - must be explicitly enabled by instructor
+enable_assist = False
 
 # Global state variable to enable/disable the eval endpoint
 # Can be controlled via /enable_eval and /disable_eval endpoints (instructor only)

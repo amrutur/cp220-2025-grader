@@ -130,6 +130,11 @@ if not INSTRUCTOR_EMAILS:
 # Can be controlled via /enable_tutor and /disable_tutor endpoints (instructor only)
 enable_assist = True
 
+# Global state variable to enable/disable the eval endpoint
+# Can be controlled via /enable_eval and /disable_eval endpoints (instructor only)
+# Default is False for security - must be explicitly enabled by instructor
+active_eval_api = False
+
 
 def access_secret_payload(project_id: str, secret_id: str, version_id: str = "latest") -> str:
     """
@@ -1181,7 +1186,11 @@ async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, us
 @app.post("/eval", response_model=EvalResponse)
 async def eval_submission(query_body: EvalRequest, request: Request):
     '''Evaluate the submitted notebook by grading all questions using the scoring agent'''
-    
+
+    # Check if eval API is enabled by instructor
+    if not active_eval_api:
+        raise HTTPException(status_code=503, detail="The evaluation API endpoint is currently inactive")
+
     runner= runner_score
 
     try:
@@ -1541,6 +1550,46 @@ async def enable_tutor(
         return {"message": "Tutor has been enabled successfully"}
     except Exception as e:
         logging.error("An exception occurred during enable_tutor: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
+@app.post("/disable_eval")
+async def disable_eval(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
+    '''
+    Disable the eval endpoint.
+    This endpoint is only accessible to instructors.
+    '''
+    global active_eval_api
+    try:
+        active_eval_api = False
+        logging.info(f"Instructor {current_user.get('email')} has disabled the eval API")
+        return {"message": "Eval API has been disabled successfully"}
+    except Exception as e:
+        logging.error("An exception occurred during disable_eval: %s", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
+@app.post("/enable_eval")
+async def enable_eval(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_instructor_user)
+):
+    '''
+    Enable the eval endpoint.
+    This endpoint is only accessible to instructors.
+    '''
+    global active_eval_api
+    try:
+        active_eval_api = True
+        logging.info(f"Instructor {current_user.get('email')} has enabled the eval API")
+        return {"message": "Eval API has been enabled successfully"}
+    except Exception as e:
+        logging.error("An exception occurred during enable_eval: %s", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 

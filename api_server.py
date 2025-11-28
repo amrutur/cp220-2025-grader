@@ -85,7 +85,7 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - [%(funcN
 # 2. Create a Console Handler (outputs to terminal/console)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(formatter)
-console_handler.setLevel(logging.INFO) # Only show INFO, WARNING, ERROR on console
+console_handler.setLevel(logging.DEBUG) # Show DEBUG messages on console
 
 # 3. Create a File Handler (outputs to a log file)
 file_handler = logging.FileHandler('app.log', mode='a')

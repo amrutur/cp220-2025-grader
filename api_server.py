@@ -1173,6 +1173,7 @@ async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, us
                     marks, response_text = await score_question(questions[qnum], answer, rubrics[qnum], runner, request, user_id)
                     total_marks += marks
                     graded[qnum] = {'marks': marks, 'response': response_text}
+                    logging.debug(f"response:{response_text}")
                     logging.info(f"Graded question {qnum}: awarded {marks}/{qmax_marks[qnum]} marks.")
                     if marks > qmax_marks[qnum]:
                         logging.error(f"Error: Awarded marks {marks} exceeds maximum {qmax_marks[qnum]} for question {qnum}.")

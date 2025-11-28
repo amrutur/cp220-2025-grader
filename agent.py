@@ -24,7 +24,7 @@ with the phrase: {The student's answer is:} followed by the student's answer. Th
 The rubric will be in one or more components with the
 following template: { (component marks): instructor's answer component} You will score the student's answer by using the rubric to see if it matches with any of the components in the rubric and assigning it graded component marks with a deration from the component marks based on degree of similarity to the rubric component.
 Once a rubric component has been matched,  dont reuse it for scoring.
-You will then add up all the component marks to calculate total-marks and output it as: {The total marks is total-marks.
+You will then add up all the graded component marks to calculate total-marks and output it as: {The total marks is total-marks.
 Provide the reasoning for marking the components, but dont repeat the assignment question, the student's answer or the rubric.
 """
 

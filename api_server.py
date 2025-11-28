@@ -105,6 +105,7 @@ root_logger.setLevel(logging.DEBUG)
 # Set specific loggers for Starlette/ADK to DEBUG if needed
 logging.getLogger("starlette").setLevel(logging.INFO)
 logging.getLogger("google_adk").setLevel(logging.DEBUG)
+logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
 # Note: Using logging.DEBUG will flood your console with internal steps,
 # which is perfect for debugging agent logic.

@@ -107,6 +107,11 @@ logging.getLogger("starlette").setLevel(logging.INFO)
 logging.getLogger("google_adk").setLevel(logging.DEBUG)
 logging.getLogger("aiosqlite").setLevel(logging.INFO)
 
+# Enable detailed logging for google_adk submodules to see full prompts
+logging.getLogger("google.adk").setLevel(logging.DEBUG)
+logging.getLogger("google.adk.runner").setLevel(logging.DEBUG)
+logging.getLogger("google.adk.agents").setLevel(logging.DEBUG)
+
 # Note: Using logging.DEBUG will flood your console with internal steps,
 # which is perfect for debugging agent logic.
 
@@ -1037,10 +1042,15 @@ async def score_question(question:str, answer:str, rubric:str, runner:Runner, re
         rubric = "The rubric is: " + rubric +"."
 
         # Create the prompt content
+        full_prompt = question + answer + rubric
         content = types.Content(
             role="user",
-            parts=[types.Part.from_text(text=question + answer + rubric)]
+            parts=[types.Part.from_text(text=full_prompt)]
         )
+
+        # Log the full prompt being sent to the scoring agent
+        logging.debug(f"Sending prompt to scoring agent for user {user_id}:")
+        logging.debug(f"Full prompt content: {full_prompt}")
 
         # Attempt to get the response using the current session ID
         response_text = await run_agent_and_get_response(session_id,user_id, content,runner)

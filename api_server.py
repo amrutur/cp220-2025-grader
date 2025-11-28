@@ -1042,7 +1042,7 @@ async def score_question(question:str, answer:str, rubric:str, runner:Runner, re
         rubric = "{The scoring rubric is:}" + rubric +"."
 
         # Create the prompt content
-        full_prompt = question + answer + rubric
+        full_prompt = question + rubric + answer
         content = types.Content(
             role="user",
             parts=[types.Part.from_text(text=full_prompt)]

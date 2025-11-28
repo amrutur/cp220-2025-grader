@@ -1037,9 +1037,9 @@ async def score_question(question:str, answer:str, rubric:str, runner:Runner, re
             )
 
 
-        question = "The assignment question is: " + question + "."
-        answer = "The student's answer is: " + answer + "."
-        rubric = "The rubric is: " + rubric +"."
+        question = "{The assignment question is:}" + question + "."
+        answer = "{The student's answer is: }" + answer + "."
+        rubric = "{The scoring rubric is:}" + rubric +"."
 
         # Create the prompt content
         full_prompt = question + answer + rubric

@@ -1240,7 +1240,10 @@ async def eval_submission(query_body: EvalRequest, request: Request):
         #This is stored in the metadata of the execution info for any code  cell of the notebook
         for i in range(len(answer_cells)):
             cell = answer_cells[i]
-            if cell['cell_type'] == 'code' and  cell['metadata']['executionInfo']['status'] == 'ok':
+            if (cell.get('cell_type') == 'code' and
+                'metadata' in cell and
+                'executionInfo' in cell.get('metadata', {}) and
+                cell['metadata']['executionInfo'].get('status') == 'ok'):
                     google_user_name = cell['metadata']['executionInfo']['user']['displayName']
                     google_user_id = cell['metadata']['executionInfo']['user']['userId']
                     break

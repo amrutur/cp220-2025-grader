@@ -1235,6 +1235,9 @@ async def eval_submission(query_body: EvalRequest, request: Request):
             answer_json = answer_json['ipynb']
         
         answer_cells = answer_json['cells'] if 'cells' in answer_json else []
+        logging.debug(f"Number of answer cells: {len(answer_cells)}")
+        if len(answer_cells) == 0:
+            logging.debug(f"answer_json={answer_json}")
         #print(f"answr cell 1 is {answer_cells[1]}")
         #extract google validated name, and id.
         #This is stored in the metadata of the execution info for any code  cell of the notebook

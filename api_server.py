@@ -1168,7 +1168,7 @@ async def evaluate(answer_json, rubric_json, runner:Runner, request: Request, us
         logging.info(f"Extracted {num_questions} questions from rubric notebook with total marks {max_marks}. Now grading answers.")
         i=0
         while i < len(acells):
-            #rint(f"Checking answer cell {i} for question pattern")
+            logging.debug(f"Checking cell [{i}] of type {acells[i]['cell_type']}")
             if acells[i]['cell_type'] == 'markdown':
                 #check if it is a question cell
                 qmatch = re.search(r"\*\*Q(\d+)\*\*", ''.join(acells[i].get('source', [])))

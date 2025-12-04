@@ -192,9 +192,40 @@ Students install the client package in their Colab notebooks:
 API endpoints can be tested by connecting to `https://AI_tutor_server_url/docs`
 
 ### Authentication
+
+The API supports two authentication methods:
+
+1. **Session-based (Browser/OAuth)**: For web browsers
+2. **JWT Token-based**: For API clients like Colab notebooks
+
+#### Endpoints
 - `GET /login` - Initiate OAuth login flow
 - `GET /callback` - OAuth callback handler
+- `GET /get_auth_token` - Get JWT token after OAuth login (for API clients)
+  - Returns: `{"token": "jwt_token_string", "token_type": "Bearer", "expires_in": 86400}`
+  - Usage: Include in subsequent API calls as `Authorization: Bearer <token>`
 - `GET /logout` - Clear user session
+
+#### Using JWT Authentication from Colab
+
+```python
+import requests
+
+# Step 1: User completes OAuth in browser
+# Direct user to: https://your-server-url.run.app/login
+
+# Step 2: After login, get JWT token (in same browser session)
+response = requests.get("https://your-server-url.run.app/get_auth_token")
+token = response.json()["token"]
+
+# Step 3: Use token in API requests
+headers = {"Authorization": f"Bearer {token}"}
+response = requests.post(
+    "https://your-server-url.run.app/some_endpoint",
+    json={...},
+    headers=headers
+)
+```
 
 ### Student Operations
 - `POST /assist` - Get teaching assistance for a question

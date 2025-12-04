@@ -189,6 +189,8 @@ Students install the client package in their Colab notebooks:
 
 ## API Endpoints
 
+API endpoints can be tested by connecting to `https://AI_tutor_server_url/docs`
+
 ### Authentication
 - `GET /login` - Initiate OAuth login flow
 - `GET /callback` - OAuth callback handler

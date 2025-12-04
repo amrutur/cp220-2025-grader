@@ -205,7 +205,12 @@ Students install the client package in their Colab notebooks:
   }
   ```
 
-- `POST /eval` - Submit notebook for grading
+### Instructor Operations (Requires Instructor Authentication)
+- `POST /enable_eval` - Enable the evaluation endpoint for student submissions
+- `POST /disable_eval` - Disable the evaluation endpoint (prevents new submissions)
+- `POST /enable_tutor` - Enable the tutoring/assist endpoint for students
+- `POST /disable_tutor` - Disable the tutoring/assist endpoint
+- `POST /eval` - Submit notebook for grading (must be enabled first)
   ```json
   {
     "notebook_json": {...},
@@ -214,15 +219,15 @@ Students install the client package in their Colab notebooks:
     "submission_hash": "md5_hash"
   }
   ```
-
-- `GET /fetch_grader_response` - Retrieve grading results
+- `POST /fetch_grader_response` - Retrieve grading results for a student
+  ```json
+  {
+    "notebook_id": "Assignment1",
+    "user_email": "student@example.com"
+  }
   ```
-  ?course_name=CP220&assignment_name=Assignment1&user_email=student@example.com
-  ```
-
-### Instructor Operations (Requires Authentication)
-- `GET /fetch_student_list` - Get all student grades
-- `POST /notify_student_grades` - Send email notifications to students
+- `POST /fetch_student_list` - Get all student grades for a course/assignment
+- `POST /notify_student_grades` - Send email notifications to students with their grades
 
 ### Diagnostics
 - `GET /` - Health check

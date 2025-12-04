@@ -945,7 +945,7 @@ async def process_query(query_body: QueryRequest, request: Request):
             parts=[types.Part.from_text(text=query_body.query)]
         )
 
-        logging.info(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_name} and notebook={query_body.notebook_name}")        
+        logging.info(f"User {user_name}, has asked for checking for question {query_body.q_name} in course {query_body.course_id} and notebook={query_body.notebook_id}")
 
         if query_body.rubric_link:
             # Read rubric notebook using the application's service account, not the logged-in user's credentials.

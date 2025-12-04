@@ -305,8 +305,6 @@ gcloud run deploy cp220-grader-api \
 cp220-2025-grader/
 ├── api_server.py          # Main FastAPI server
 ├── agent.py               # AI agent definitions (teaching & scoring)
-├── prompt.py              # Agent prompts
-├── ask_form.py            # Helper functions
 ├── requirements.txt       # Python dependencies
 ├── Dockerfile             # Container definition
 ├── .dockerignore          # Docker build exclusions

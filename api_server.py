@@ -1241,6 +1241,8 @@ async def eval_submission(query_body: EvalRequest, request: Request):
         #print(f"answr cell 1 is {answer_cells[1]}")
         #extract google validated name, and id.
         #This is stored in the metadata of the execution info for any code  cell of the notebook
+        google_user_name = None
+        google_user_id = None
         for i in range(len(answer_cells)):
             cell = answer_cells[i]
             if (cell.get('cell_type') == 'code' and

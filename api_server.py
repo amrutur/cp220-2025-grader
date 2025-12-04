@@ -118,12 +118,6 @@ logging.getLogger("google.adk.agents").setLevel(logging.DEBUG)
 # which is perfect for debugging agent logic.
 
 
-# Disable the assist API during this time window
-# should be made configurable via environment variables
-# or via firestore database in the future
-ASSIST_API_DISABLE_START = datetime.datetime(2025, 10, 6,12,00,00)
-ASSIST_API_DISABLE_END = datetime.datetime(2025, 10, 6,17,0,00)
-
 # List of authorized instructor emails loaded from environment variable
 # Set INSTRUCTOR_EMAILS environment variable with comma-separated email addresses
 # Example: INSTRUCTOR_EMAILS="instructor1@example.com,instructor2@example.com"

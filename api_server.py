@@ -1214,21 +1214,12 @@ async def eval_submission(query_body: EvalRequest, request: Request):
         #user_id = request.session['user']['id']
         #user_name = request.session['user']['name']
 
-        user_email = query_body.user_email 
+        user_email = query_body.user_email
         user_name = query_body.user_name
 
-        answer_notebook = query_body.answer_notebook          
+        answer_json = query_body.answer_notebook
         answer_hash = query_body.answer_hash
         rubric_link = query_body.rubric_link
-
-        try:
-            # .ipynb files are JSON, so we can return them as JSON
-            #answer_json = json.loads(answer_notebook)
-            answer_json = answer_notebook
-        except json.JSONDecodeError:
-            # Or return as plain text if it's not valid JSON for some reason
-            return HTMLResponse(content=f"<pre>Could not parse notebook as JSON. Raw content:\n\n</pre>")
-
 
         #extract the cells from the notebook
         if ('ipynb' in answer_json): #remove one hierarchy if present
@@ -1262,7 +1253,7 @@ async def eval_submission(query_body: EvalRequest, request: Request):
 
         add_user_if_not_exists(db, google_user_id, user_name, user_email, google_user_name)
 
-        add_answer_notebook(db, google_user_id, query_body.notebook_id, answer_notebook, answer_hash)
+        add_answer_notebook(db, google_user_id, query_body.notebook_id, query_body.answer_notebook, answer_hash)
 
         # Read rubric notebook using the application's service account, not the logged-in user's credentials.
         logging.info(f"rubric link is {query_body.rubric_link}")

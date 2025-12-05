@@ -525,7 +525,7 @@ class FetchGradedResponse(BaseModel):
 
 class NotifyGradedRequest(BaseModel):
     notebook_id: str
-    user_email: EmailStr
+    user_email: EmailStr | None = None
 
 class NotifyGradedResponse(BaseModel):
     response: str
@@ -1579,45 +1579,130 @@ async def notify_student_grades_api(
     current_user: Dict[str, Any] = Depends(get_instructor_user)
 ):
     '''Fetch the graded response for a student from the database and send email notification.
+    If user_email is provided, sends email to that specific student.
+    If user_email is None, sends email to all students who have graded submissions for the notebook.
     This endpoint is only accessible to instructors.'''
     try:
-
 
         if not query_body.notebook_id:
             raise HTTPException(status_code=400, detail="notebook_id not provided")
 
-        if not query_body.user_email:
-            raise HTTPException(status_code=400, detail="user_email not provided")
+        # If user_email is provided, send to single student (original behavior)
+        if query_body.user_email:
+            user_email = query_body.user_email
 
-        user_email = query_body.user_email
+            grader_response = fetch_grader_response(db, notebook_id=query_body.notebook_id, user_email=user_email)
+            if not grader_response:
+                raise HTTPException(status_code=404, detail="No graded response found")
 
-        grader_response = fetch_grader_response(db, notebook_id=query_body.notebook_id, user_email=user_email)
-        #logging.debug(f"Fetched grader response: {grader_response}")
-        if not grader_response:
-            raise HTTPException(status_code=404, detail="No graded response found")
+            user_name = grader_response.get('user_name', 'Student')
+            total_marks = grader_response.get('total_marks', 0)
+            max_marks = grader_response.get('max_marks', 0)
+            subject = f"Graded Response for your submission {query_body.notebook_id}"
+            msg_body = f"Hello {user_name},\n\n Your marks in {query_body.notebook_id} is {total_marks} out of {max_marks}. \n\nDetailed feedback for your submission"
 
-        user_name = grader_response.get('user_name', 'Student')
-        total_marks = grader_response.get('total_marks', 0)
-        max_marks = grader_response.get('max_marks', 0)
-        subject = f"Graded Response for your submission {query_body.notebook_id}"
-        msg_body = f"Hello {user_name},\n\n Your marks in {query_body.notebook_id} is {total_marks} out of {max_marks}. \n\nDetailed feedback for your submission"
+            msg_body += json.dumps(grader_response, indent=4)
 
-        msg_body += json.dumps(grader_response, indent=4)
+            msg_body+="\n\nBest regards,\nCP220-2025 Grading Assistant"
 
-        msg_body+="\n\nBest regards,\nCP220-2025 Grading Assistant"
+            logging.info(f"Instructor {current_user.get('email')} is sending email to {user_email} with subject '{subject}'")
 
-        logging.info(f"Instructor {current_user.get('email')} is sending email to {user_email} with subject '{subject}'")
+            email_sent = send_email(sendgrid_client, sendgrid_from_email, user_email, subject, msg_body)
 
-        email_sent = send_email(sendgrid_client, sendgrid_from_email, user_email, subject, msg_body)
+            if email_sent:
+                return NotifyGradedResponse(
+                    response=f"Successfully sent email to {user_email} with graded response."
+                )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to send email. Please check server logs and ensure email service is properly configured."
+                )
 
-        if email_sent:
-            return NotifyGradedResponse(
-                response=f"Successfully sent email to {user_email} with graded response."
-            )
+        # If user_email is None, send to all students with graded submissions (bulk email)
         else:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to send email. Please check server logs and ensure email service is properly configured."
+            logging.info(f"Instructor {current_user.get('email')} is sending bulk emails for notebook {query_body.notebook_id}")
+
+            user_list = get_user_list(db)
+            emails_sent = 0
+            emails_failed = 0
+            students_notified = []
+
+            for user_id in user_list:
+                try:
+                    # Check if student has submitted this notebook
+                    answer_doc = db.collection(u'users').document(user_id).collection(u'notebooks').document(query_body.notebook_id).get()
+
+                    if answer_doc.exists:
+                        answer_data = answer_doc.to_dict()
+
+                        # Check if the submission has been graded (has graded_json or graded field)
+                        graded_data = answer_data.get('graded_json')
+                        if graded_data is None:
+                            # Backward compatibility: try old 'graded' field
+                            graded_string = answer_data.get('graded')
+                            if graded_string:
+                                graded_data = json.loads(graded_string)
+
+                        # If there's graded data, send email
+                        if graded_data:
+                            # Get user info
+                            userinfo_doc = db.collection(u'users').document(user_id).get()
+                            if userinfo_doc.exists:
+                                user_info = userinfo_doc.to_dict()
+                                user_email = user_info.get('email')
+                                user_name = user_info.get('name', 'Student')
+
+                                if user_email:
+                                    # Prepare email
+                                    total_marks = answer_data.get('total_marks', 0)
+                                    max_marks = answer_data.get('max_marks', 0)
+                                    subject = f"Graded Response for your submission {query_body.notebook_id}"
+
+                                    grader_response = {
+                                        'user_name': user_name,
+                                        'total_marks': total_marks,
+                                        'max_marks': max_marks,
+                                        'feedback': graded_data
+                                    }
+
+                                    msg_body = f"Hello {user_name},\n\n Your marks in {query_body.notebook_id} is {total_marks} out of {max_marks}. \n\nDetailed feedback for your submission"
+                                    msg_body += json.dumps(grader_response, indent=4)
+                                    msg_body += "\n\nBest regards,\nCP220-2025 Grading Assistant"
+
+                                    # Send email
+                                    email_sent = send_email(sendgrid_client, sendgrid_from_email, user_email, subject, msg_body)
+
+                                    if email_sent:
+                                        emails_sent += 1
+                                        students_notified.append(user_email)
+                                        logging.info(f"Sent grade notification to {user_email}")
+                                    else:
+                                        emails_failed += 1
+                                        logging.warning(f"Failed to send grade notification to {user_email}")
+                                else:
+                                    logging.warning(f"User {user_id} has no email address")
+                            else:
+                                logging.warning(f"User document for user_id {user_id} does not exist")
+
+                except Exception as e:
+                    logging.error(f"Error processing user {user_id}: {e}")
+                    emails_failed += 1
+                    continue
+
+            # Return summary
+            summary = f"Bulk email completed: {emails_sent} emails sent successfully"
+            if emails_failed > 0:
+                summary += f", {emails_failed} failed"
+            if students_notified:
+                summary += f". Notified: {', '.join(students_notified[:5])}"
+                if len(students_notified) > 5:
+                    summary += f" and {len(students_notified) - 5} more"
+
+            logging.info(summary)
+
+            return NotifyGradedResponse(
+                response=summary
             )
 
     except Exception as e:
